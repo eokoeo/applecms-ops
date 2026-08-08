@@ -6,17 +6,29 @@ Ubuntu 22.04.5 LTS 丨 环境:1panel 丨 php版本：7.4.33
 
 使用方法 set 文件夹 上传站点根目录
 类似
+
 addons
+
 application
+
 extend
+
 runtime
+
 set
+
 static
+
 static_new
+
 template
+
 thinkphp
+
 upload
+
 vendor
+
 浏览器输入https://域名.com/set/
 
 
