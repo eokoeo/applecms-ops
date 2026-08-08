@@ -1,4 +1,3 @@
-```php
 <?php
 /**
  * AppleCMS OPS
@@ -2939,4 +2938,3 @@ input {
 
 </body>
 </html>
-```
