@@ -1,7 +1,4 @@
 <?php
-
-declare(strict_types=1);
-
 /**
  * AppleCMS OPS - Redis Manager (Fixed & Optimized)
  * 
@@ -10,14 +7,12 @@ declare(strict_types=1);
  * 2. 优化 SCAN 匹配逻辑，采用全包围通配符 (*keyword*)，确保能顺利搜到 xgplayer4_page 等缓存。
  * 3. 完善批量删除、全库清空及防重刷跳转（PRG 模式）。
  */
+declare(strict_types=1);
 
 session_start();
-
-
-/* =========================================================
- * 基础路径
- * ======================================================= */
-
+require_once 'login.php';
+ 
+/*
 $APP_ROOT = realpath(__DIR__ . '/..');
 
 if ($APP_ROOT === false) {
@@ -25,8 +20,7 @@ if ($APP_ROOT === false) {
 }
 
 $MACCMS_CONFIG = $APP_ROOT . '/application/extra/maccms.php';
-
-
+*/
 /* =========================================================
  * 工具函数
  * ======================================================= */
