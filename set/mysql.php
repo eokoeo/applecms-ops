@@ -1,7 +1,7 @@
 <?php
 /**
  * AppleCMS OPS
- * MySQL Management, Diagnostics & Batch Tools
+ * MySQL Management, Diagnostics, Video Tools & Native Stream Backup
  *
  * PHP 7.4+
  */
@@ -9,9 +9,12 @@
 declare(strict_types=1);
 
 session_start();
+require_once 'login.php';
 
-$APP_ROOT = realpath(__DIR__ . '/..') ?: dirname(__DIR__);
-$DATABASE_CONFIG = $APP_ROOT . '/application/database.php';
+@ini_set('max_execution_time', '0');
+@ini_set('memory_limit', '1024M');
+
+ 
 
 function h($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
@@ -48,76 +51,251 @@ function statusBadge(bool $ok, string $success = '成功链接', string $failed 
 
 $databaseConfig = loadPhpConfig($DATABASE_CONFIG);
 
-$dbHost = findConfigValue($databaseConfig, 'hostname', $dbHostFound);
-$dbName = findConfigValue($databaseConfig, 'database', $dbNameFound);
-$dbUser = findConfigValue($databaseConfig, 'username', $dbUserFound);
-$dbPassword = findConfigValue($databaseConfig, 'password', $dbPasswordFound);
-$dbPort = findConfigValue($databaseConfig, 'hostport', $dbPortFound) ?: 3306;
+$dbHost = findConfigValue($databaseConfig, 'hostname', $dbHostFound) ?: '1Panel-mysql-FuPN';
+$dbName = findConfigValue($databaseConfig, 'database', $dbNameFound) ?: 'ajavrom';
+$dbUser = findConfigValue($databaseConfig, 'username', $dbUserFound) ?: 'root';
+$dbPassword = findConfigValue($databaseConfig, 'password', $dbPasswordFound) ?: '';
+$dbPort = (int)(findConfigValue($databaseConfig, 'hostport', $dbPortFound) ?: 3306);
 $dbPrefix = findConfigValue($databaseConfig, 'prefix', $dbPrefixFound) ?: 'mac_';
 
 $dbConnected = false;
 $dbError = '';
+$dbVersion = '';
+$pingTime = 0;
+$tableCount = 0;
 $pdo = null;
-$dbServerInfo = [];
-$tableStats = [];
+
 $actionMessage = '';
 $actionError = '';
 $searchResults = [];
 $searchError = '';
 $searchKeyword = trim($_GET['s'] ?? ($_POST['search_keyword'] ?? ''));
 
-if (!$dbHostFound || !$dbName) {
-    $dbError = '未能在 database.php 中读取到完整的 MySQL 配置信息。';
-} else {
-    try {
-        $startTime = microtime(true);
-        $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $dbHost, (int)$dbPort, $dbName);
-        $pdo = new PDO($dsn, (string)$dbUser, (string)$dbPassword, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_TIMEOUT => 3,
-            PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
-        ]);
-        $pingTime = round((microtime(true) - $startTime) * 1000, 2);
-        $dbConnected = true;
+try {
+    $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $dbHost, $dbPort, $dbName);
+    $timeStart = microtime(true);
+    $pdo = new PDO($dsn, (string)$dbUser, (string)$dbPassword, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT => 3,
+        PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
+    ]);
+    $pingTime = round((microtime(true) - $timeStart) * 1000, 2);
+    $dbConnected = true;
 
-        $versionStmt = $pdo->query("SELECT VERSION() as version, @@version_comment as comment");
-        $vData = $versionStmt->fetch(PDO::FETCH_ASSOC);
-        $dbServerInfo['version'] = $vData['version'] ?? 'Unknown';
-        $dbServerInfo['comment'] = $vData['comment'] ?? '';
-        $dbServerInfo['ping'] = $pingTime;
-
-        $tablesQuery = $pdo->query("SHOW TABLE STATUS");
-        while ($row = $tablesQuery->fetch(PDO::FETCH_ASSOC)) {
-            $tableStats[] = [
-                'name' => $row['Name'],
-                'rows' => $row['Rows'] ?? 0,
-                'data_length' => round(($row['Data_Length'] ?? 0) / 1024 / 1024, 2),
-                'index_length' => round(($row['Index_Length'] ?? 0) / 1024 / 1024, 2),
-                'engine' => $row['Engine'] ?? '',
-                'update_time' => $row['Update_Time'] ?? '-'
-            ];
-        }
-
-    } catch (Throwable $e) {
-        $dbError = $e->getMessage();
-    }
+    $dbVersion = $pdo->query('SELECT VERSION()')->fetchColumn();
+    $stmtTables = $pdo->query('SHOW TABLES');
+    $allTables = $stmtTables->fetchAll(PDO::FETCH_COLUMN);
+    $tableCount = count($allTables);
+} catch (Throwable $e) {
+    $dbError = $e->getMessage();
 }
 
+// -------------------------------------------------------------------------
+// 纯 PHP 高性能主键游标（Keyset Pagination）流式日志备份（带精细进度回显）
+// -------------------------------------------------------------------------
+if (isset($_GET['action']) && $_GET['action'] === 'stream_backup') {
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache');
+    header('Connection: keep-alive');
+
+    if (function_exists('apache_setenv')) {
+        @apache_setenv('no-gzip', '1');
+    }
+    @ini_set('output_buffering', 'Off');
+    @ini_set('zlib.output_compression', '0');
+    while (ob_get_level() > 0) {
+        ob_end_flush();
+    }
+
+    function sendLog(string $msg, string $type = 'info') {
+        echo "data: " . json_encode(['msg' => $msg, 'type' => $type], JSON_UNESCAPED_UNICODE) . "\n\n";
+        flush();
+    }
+
+    $timeStr = date('Y-m-d H:i:s');
+    sendLog("{$timeStr} 备份 [mysql - {$dbName}] 任务开始 [START]");
+
+    try {
+        if (!class_exists('ZipArchive')) {
+            throw new Exception("PHP ZipArchive 扩展未安装");
+        }
+
+        $stmt = $pdo->query('SHOW TABLES');
+        $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        $totalTables = count($tables);
+
+        $zipName = ($dbName ?: 'database') . '_' . date('Y-m-d_H-i-s') . '.zip';
+        $localTmpZip = __DIR__ . '/backup_' . uniqid() . '.zip';
+        $localSqlFile = __DIR__ . '/db_' . uniqid() . '.sql';
+
+        sendLog("正在初始化高性能主键游标导出引擎...");
+        $fp = fopen($localSqlFile, 'w');
+        if (!$fp) {
+            throw new Exception("无法创建临时 SQL 文件");
+        }
+
+        fwrite($fp, "-- AppleCMS OPS Backup for {$dbName}\n");
+        fwrite($fp, "-- Date: " . date('Y-m-d H:i:s') . "\n\n");
+        fwrite($fp, "SET FOREIGN_KEY_CHECKS=0;\n\n");
+
+        foreach ($tables as $i => $table) {
+            $num = $i + 1;
+            sendLog("正在打包表 [ {$num}/{$totalTables} ]: `{$table}` ...");
+
+            // 写入表结构
+            $createStmt = $pdo->query("SHOW CREATE TABLE `{$table}`")->fetch(PDO::FETCH_ASSOC);
+            fwrite($fp, "DROP TABLE IF EXISTS `{$table}`;\n");
+            fwrite($fp, $createStmt['Create Table'] . ";\n\n");
+
+            // 查找表的主键或唯一索引作为游标字段
+            $pkCol = '';
+            $pkStmt = $pdo->query("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'");
+            $pkRow = $pkStmt->fetch(PDO::FETCH_ASSOC);
+            if ($pkRow && isset($pkRow['Column_name'])) {
+                $pkCol = $pkRow['Column_name'];
+            }
+
+            $batchSize = 2000;
+            $rowCountTotal = 0;
+            if ($pkCol) {
+                $lastPk = null;
+                while (true) {
+                    if ($lastPk === null) {
+                        $rowStmt = $pdo->query("SELECT * FROM `{$table}` ORDER BY `{$pkCol}` ASC LIMIT {$batchSize}");
+                    } else {
+                        $stmtPrep = $pdo->prepare("SELECT * FROM `{$table}` WHERE `{$pkCol}` > ? ORDER BY `{$pkCol}` ASC LIMIT {$batchSize}");
+                        $stmtPrep->execute([$lastPk]);
+                        $rowStmt = $stmtPrep;
+                    }
+                    $rows = $rowStmt->fetchAll(PDO::FETCH_ASSOC);
+                    if (empty($rows)) {
+                        break;
+                    }
+
+                    foreach ($rows as $row) {
+                        $lastPk = $row[$pkCol];
+                        $rowCountTotal++;
+                        $fields = array_keys($row);
+                        $values = array_values($row);
+                        $escFields = array_map(function($f){ return '`' . $f . '`'; }, $fields);
+                        $escValues = array_map(function($v) use ($pdo) {
+                            if ($v === null) return 'NULL';
+                            return $pdo->quote((string)$v);
+                        }, $values);
+
+                        $insertLine = "INSERT INTO `{$table}` (" . implode(', ', $escFields) . ") VALUES (" . implode(', ', $escValues) . ");\n";
+                        fwrite($fp, $insertLine);
+                    }
+
+                    // 如果数据量较大，每批次汇报一次进度，防止浏览器端因长时间无输出产生焦虑
+                    if ($rowCountTotal > 5000 && ($rowCountTotal % 10000 === 0)) {
+                        sendLog("  -> `{$table}` 已导出 {$rowCountTotal} 行数据...", "warn");
+                    }
+
+                    if (count($rows) < $batchSize) {
+                        break;
+                    }
+                }
+            } else {
+                $rowStmt = $pdo->query("SELECT * FROM `{$table}`");
+                while ($row = $rowStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $rowCountTotal++;
+                    $fields = array_keys($row);
+                    $values = array_values($row);
+                    $escFields = array_map(function($f){ return '`' . $f . '`'; }, $fields);
+                    $escValues = array_map(function($v) use ($pdo) {
+                        if ($v === null) return 'NULL';
+                        return $pdo->quote((string)$v);
+                    }, $values);
+
+                    $insertLine = "INSERT INTO `{$table}` (" . implode(', ', $escFields) . ") VALUES (" . implode(', ', $escValues) . ");\n";
+                    fwrite($fp, $insertLine);
+                }
+            }
+            fwrite($fp, "\n");
+        }
+
+        fwrite($fp, "SET FOREIGN_KEY_CHECKS=1;\n");
+        fclose($fp);
+
+        $sqlFileSize = filesize($localSqlFile);
+        $sqlFileMB = round($sqlFileSize / 1024 / 1024, 2);
+        sendLog("数据表全部转储完毕 (SQL 大小约 {$sqlFileMB} MB)，正在创建 ZIP 压缩包...");
+
+        $zip = new ZipArchive();
+        if ($zip->open($localTmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
+            sendLog("正在向 ZIP 中写入数据库文件...");
+            $zip->addFile($localSqlFile, "{$dbName}.sql");
+            sendLog("正在执行最终压缩归档...");
+            $zip->close();
+        } else {
+            throw new Exception("无法创建 ZIP 压缩包");
+        }
+
+        @unlink($localSqlFile);
+        $_SESSION['ready_download_zip'] = $localTmpZip;
+        $_SESSION['ready_download_name'] = $zipName;
+
+        $endStr = date('Y-m-d H:i:s');
+        sendLog("{$endStr} 备份 [mysql - {$dbName}] 成功 [TASK-END]", "success");
+        echo "data: " . json_encode(['done' => true, 'file' => $zipName], JSON_UNESCAPED_UNICODE) . "\n\n";
+        flush();
+
+    } catch (Throwable $e) {
+        if (isset($fp) && is_resource($fp)) {
+            fclose($fp);
+        }
+        @unlink($localSqlFile);
+        sendLog("备份失败: " . $e->getMessage(), "error");
+        echo "data: " . json_encode(['done' => true, 'error' => true], JSON_UNESCAPED_UNICODE) . "\n\n";
+        flush();
+    }
+    exit;
+}
+
+// 触发最终下载
+if (isset($_GET['action']) && $_GET['action'] === 'download_ready_zip') {
+    $path = $_SESSION['ready_download_zip'] ?? '';
+    $name = $_SESSION['ready_download_name'] ?? 'database.zip';
+    if ($path && file_exists($path)) {
+        header('Content-Type: application/zip');
+        header('Content-Disposition: attachment; filename="' . $name . '"');
+        header('Content-Length: ' . filesize($path));
+        readfile($path);
+        @unlink($path);
+        unset($_SESSION['ready_download_zip'], $_SESSION['ready_download_name']);
+        exit;
+    }
+    die('文件已失效');
+}
+
+// 处理 AJAX 请求：优化表
+if (isset($_GET['action']) && $_GET['action'] === 'optimize') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!$dbConnected) {
+        echo json_encode(['success' => false, 'message' => '数据库未连接']);
+        exit;
+    }
+    try {
+        $stmt = $pdo->query('SHOW TABLES');
+        $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($tables as $table) {
+            $escapedTable = '`' . str_replace('`', '``', $table) . '`';
+            $pdo->exec("OPTIMIZE TABLE {$escapedTable}");
+        }
+        echo json_encode(['success' => true, 'message' => '成功优化 ' . count($tables) . ' 个数据表']);
+    } catch (Throwable $e) {
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// 处理 POST 业务操作
 if ($dbConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $vodTable = $dbPrefix . 'vod';
 
-    if ($action === 'optimize_tables') {
-        try {
-            foreach ($tableStats as $t) {
-                $tName = $t['name'];
-                $pdo->exec("OPTIMIZE TABLE `{$tName}`");
-            }
-            $actionMessage = "成功对所有数据库表进行了碎片优化 (OPTIMIZE TABLE)。";
-        } catch (Throwable $e) {
-            $actionError = "优化表失败: " . $e->getMessage();
-        }
-    } elseif ($action === 'update_vod') {
+    if ($action === 'update_vod') {
         $vodId = (int)($_POST['vod_id'] ?? 0);
         $vodName = trim($_POST['vod_name'] ?? '');
         $vodStatus = (int)($_POST['vod_status'] ?? 1);
@@ -225,8 +403,10 @@ a { color: inherit; text-decoration: none; }
 .page-header p { color: #64748b; margin: 7px 0 0; font-size: 13px; }
 .alert { background: #fff1f2; border: 1px solid #fecdd3; color: #be123c; padding: 13px 15px; border-radius: 9px; margin-bottom: 18px; font-size: 13px; }
 .success-box { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; padding: 13px 15px; border-radius: 9px; margin-bottom: 18px; font-size: 13px; }
-.btn { background: #2563eb; color: #fff; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.btn { background: #2563eb; color: #fff; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
 .btn:hover { background: #1d4ed8; }
+.btn-success { background: #16a34a; }
+.btn-success:hover { background: #15803d; }
 .btn-danger { background: #dc2626; }
 .btn-danger:hover { background: #b91c1c; }
 .form-control { padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; outline: none; }
@@ -236,6 +416,16 @@ a { color: inherit; text-decoration: none; }
 .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
 .data-table th { color: #64748b; font-weight: 600; background: #f8fafc; }
 .data-table tr:hover { background: #f8fafc; }
+.actions-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+/* 1Panel 风格控制台弹窗样式 */
+.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 999; }
+.modal-box { background: #111827; color: #f3f4f6; padding: 20px; border-radius: 12px; width: 600px; max-width: 90%; box-shadow: 0 10px 25px rgba(0,0,0,0.3); font-family: monospace; }
+.terminal-log { background: #030712; color: #22c55e; padding: 15px; border-radius: 8px; height: 260px; overflow-y: auto; font-size: 12px; line-height: 1.5; border: 1px solid #1f2937; }
+.terminal-log div { margin-bottom: 4px; word-break: break-all; }
+.terminal-log .error { color: #ef4444; }
+.terminal-log .warn { color: #f59e0b; }
+.terminal-log .success { color: #38bdf8; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -243,7 +433,7 @@ a { color: inherit; text-decoration: none; }
     <aside class="sidebar">
         <div class="logo">AppleCMS OPS<small>Server Management</small></div>
         <div class="menu-title">Overview</div>
-        <a class="menu-item" href="index.php?page=dashboard"><span class="menu-icon">⌂</span><span class="menu-text">Dashboard</span></a>
+        <a class="menu-item" href="index.php"><span class="menu-icon">⌂</span><span class="menu-text">Dashboard</span></a>
         <div class="menu-title">Services</div>
         <a class="menu-item" href="redis.php"><span class="menu-icon">R</span><span class="menu-text">Redis</span></a>
         <a class="menu-item active" href="mysql.php"><span class="menu-icon">M</span><span class="menu-text">MySQL</span></a>
@@ -259,7 +449,7 @@ a { color: inherit; text-decoration: none; }
         <section class="content">
             <div class="page-header">
                 <h1>MySQL Database (<?php echo h($dbPrefix . 'vod'); ?>)</h1>
-                <p>AppleCMS 视频表数据检索、单条标题/状态/封面/播放地址维护与全局字段替换</p>
+                <p>AppleCMS 视频表数据检索、单条标题/状态/封面/播放地址维护、全局字段替换与 1Panel 实时流式备份</p>
             </div>
 
             <?php if ($actionError): ?>
@@ -274,6 +464,7 @@ a { color: inherit; text-decoration: none; }
                 <div class="alert"><?php echo h($searchError); ?></div>
             <?php endif; ?>
 
+            <!-- 1. 视频检索与单条维护区块 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Video Search & Edit (<?php echo h($dbPrefix . 'vod'); ?> 检索与单条维护)</h3>
@@ -335,6 +526,7 @@ a { color: inherit; text-decoration: none; }
                 <?php endif; ?>
             </div>
 
+            <!-- 2. 全局字段替换区块 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Global Batch Replace (<?php echo h($dbPrefix . 'vod'); ?> 全局字段替换工具)</h3>
@@ -363,42 +555,131 @@ a { color: inherit; text-decoration: none; }
                 </form>
             </div>
 
+            <!-- 3. 数据库连接状态与 ZIP 下载区块 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Connection Status & Tables</h3>
                     <?php echo statusBadge($dbConnected); ?>
                 </div>
 
-                <?php if (!$dbConnected): ?>
-                    <div class="alert" style="margin-bottom:0;"><?php echo h($dbError); ?></div>
-                <?php else: ?>
-                    <div class="success-box" style="margin-bottom:15px;">MySQL 数据库连接成功，响应延迟: <b><?php echo h($dbServerInfo['ping']); ?> ms</b></div>
-                <?php endif; ?>
+                <div class="info-row">
+                    <span class="info-label">连接状态描述</span>
+                    <span class="info-value">
+                        <?php if ($dbConnected): ?>
+                            MySQL 数据库连接成功，响应延迟: <span style="color:#16a34a;"><?php echo $pingTime; ?> ms</span>
+                        <?php else: ?>
+                            <span style="color:#dc2626;"><?php echo h($dbError); ?></span>
+                        <?php endif; ?>
+                    </span>
+                </div>
+                <div class="info-row"><span class="info-label">Host / Port</span><span class="info-value"><?php echo h($dbHost . ':' . $dbPort); ?></span></div>
+                <div class="info-row"><span class="info-label">Database Name</span><span class="info-value"><?php echo h($dbName); ?></span></div>
+                <div class="info-row"><span class="info-label">Username</span><span class="info-value"><?php echo h($dbUser); ?></span></div>
+                <div class="info-row"><span class="info-label">MySQL Version</span><span class="info-value"><?php echo h($dbVersion ?: 'Unknown'); ?></span></div>
+                <div class="info-row"><span class="info-label">数据表总数</span><span class="info-value"><?php echo (int)$tableCount; ?> 个</span></div>
 
-                <div class="info-row" style="margin-top: 10px;">
-                    <span class="info-label">Host / Port</span>
-                    <span class="info-value"><?php echo h($dbHost . ':' . $dbPort); ?></span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Database Name</span>
-                    <span class="info-value"><?php echo h($dbName); ?></span>
-                </div>
                 <?php if ($dbConnected): ?>
-                <div class="info-row">
-                    <span class="info-label">MySQL Version</span>
-                    <span class="info-value"><?php echo h($dbServerInfo['version']); ?></span>
-                </div>
-                <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center;">
-                    <div style="font-size: 13px; color: #64748b;">数据表总数：<?php echo count($tableStats); ?> 个</div>
-                    <form method="POST" style="margin: 0;" onsubmit="return confirm('确定要对所有数据表执行碎片优化吗？');">
-                        <input type="hidden" name="action" value="optimize_tables">
-                        <button type="submit" class="btn">🧹 优化全部数据表</button>
-                    </form>
+                <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #f1f5f9;" class="actions-bar">
+                    <button class="btn" onclick="optimizeTables()">🧹 优化全部数据表</button>
+                    <button class="btn btn-success" onclick="start1PanelBackup()">📦 1Panel 实时流式备份下载 (.zip)</button>
                 </div>
                 <?php endif; ?>
             </div>
         </section>
     </main>
 </div>
+
+<!-- 1Panel 风格终端日志弹窗 -->
+<div id="backupModal" class="modal-overlay">
+    <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <h3 style="margin: 0; font-size: 15px; color: #fff;">数据库备份任务实时日志</h3>
+            <button id="closeModalBtn" onclick="closeBackupModal()" style="background: transparent; border: none; color: #9ca3af; font-size: 16px; cursor: pointer; display: none;">✕</button>
+        </div>
+        <div id="terminalLog" class="terminal-log">
+            <div>等待发起备份任务...</div>
+        </div>
+        <div id="modalFooter" style="margin-top: 15px; text-align: right; display: none;">
+            <button class="btn btn-success" onclick="downloadBackupFile()" style="font-size: 12px;">⬇️ 下载打包好的压缩包</button>
+        </div>
+    </div>
+</div>
+
+<script>
+function optimizeTables() {
+    if (!confirm('确定要对全部数据表执行 OPTIMIZE TABLE 优化吗？')) return;
+    fetch('mysql.php?action=optimize')
+        .then(res => res.json())
+        .then(data => {
+            alert(data.message);
+            if (data.success) {
+                location.reload();
+            }
+        })
+        .catch(err => {
+            alert('优化请求失败: ' + err);
+        });
+}
+
+let downloadUrl = '';
+
+function start1PanelBackup() {
+    const modal = document.getElementById('backupModal');
+    const logBox = document.getElementById('terminalLog');
+    const footer = document.getElementById('modalFooter');
+    const closeBtn = document.getElementById('closeModalBtn');
+
+    modal.style.display = 'flex';
+    const nowStr = new Date().toLocaleString();
+    logBox.innerHTML = `<div>${nowStr} 备份 [mysql - ajavrom] 任务开始 [START]</div>`;
+    footer.style.display = 'none';
+    closeBtn.style.display = 'none';
+
+    // 使用 Server-Sent Events (EventSource) 接收实时流式日志
+    const eventSource = new EventSource('mysql.php?action=stream_backup');
+
+    eventSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        if (data.msg) {
+            let cssClass = '';
+            if (data.type === 'error') cssClass = 'error';
+            if (data.type === 'warn') cssClass = 'warn';
+            if (data.type === 'success') cssClass = 'success';
+            
+            logBox.innerHTML += `<div class="${cssClass}">${data.msg}</div>`;
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        if (data.done) {
+            eventSource.close();
+            closeBtn.style.display = 'block';
+            if (data.error) {
+                logBox.innerHTML += `<div class="error">[ERROR] 备份任务异常终止。</div>`;
+            } else {
+                logBox.innerHTML += `<div class="success">[SUCCESS] 备份压缩包已准备就绪！</div>`;
+                footer.style.display = 'block';
+                downloadUrl = 'mysql.php?action=download_ready_zip';
+            }
+        }
+    };
+
+    eventSource.onerror = function() {
+        eventSource.close();
+        logBox.innerHTML += `<div class="error">[ERROR] 连接中断或脚本超时。</div>`;
+        closeBtn.style.display = 'block';
+    };
+}
+
+function closeBackupModal() {
+    document.getElementById('backupModal').style.display = 'none';
+}
+
+function downloadBackupFile() {
+    if (downloadUrl) {
+        window.location.href = downloadUrl;
+    }
+}
+</script>
 </body>
 </html>
