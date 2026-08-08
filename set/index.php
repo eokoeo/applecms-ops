@@ -7,12 +7,10 @@
  */
 
 declare(strict_types=1);
-
 session_start();
+require_once 'login.php';
 
-$APP_ROOT = realpath(__DIR__ . '/..') ?: dirname(__DIR__);
-$DATABASE_CONFIG = $APP_ROOT . '/application/database.php';
-$MAC_CMS_CONFIG = $APP_ROOT . '/application/extra/maccms.php';
+ 
 
 function h($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
