@@ -307,6 +307,9 @@ $phpVersion = PHP_VERSION;
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>AppleCMS OPS - Site Files Manager</title>
+<!-- 引入成熟的 CodeMirror 5 核心样式与 Dracula 主题，彻底告别双滚动条与错位重影 -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
 <style>
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; min-height: 100%; }
@@ -350,70 +353,15 @@ a { color: inherit; text-decoration: none; }
 .data-table tr:hover { background: #f8fafc; }
 .breadcrumb { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 15px; color: #475569; background: #f8fafc; padding: 10px 15px; border-radius: 8px; border: 1px solid #e2e8f0; }
 
-/* 炫彩代码编辑器：单框视口、内置高亮、无重影双滚动条 */
-.editor-container {
-    position: relative;
-    display: flex;
-    background: #1e1e1e;
+/* 宝塔/1Panel同款成熟高亮编辑器容器配置 */
+.CodeMirror {
+    height: 550px;
     border-radius: 9px;
     border: 1px solid #333;
-    height: 550px;
-    overflow: hidden;
-}
-.line-numbers-col {
-    width: 55px;
-    background: #252526;
-    color: #858585;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 13px;
-    padding-top: 12px;
-    text-align: right;
-    user-select: none;
-    line-height: 20px;
-    overflow: hidden;
-    border-right: 1px solid #333;
-    flex-shrink: 0;
+    line-height: 1.5;
 }
-.line-numbers-col div { height: 20px; padding-right: 8px; }
-
-.editor-scroll-area {
-    position: relative;
-    flex: 1;
-    height: 100%;
-    overflow: auto;
-}
-
-/* 核心：真正的可编辑带有绚丽语法的组合层 */
-.code-textarea {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 13px;
-    line-height: 20px;
-    background: #1e1e1e;
-    color: #d4d4d4;
-    border: none;
-    resize: none;
-    outline: none;
-    white-space: pre;
-    overflow-wrap: normal;
-    tab-size: 4;
-    z-index: 2;
-    spellcheck: false;
-}
-
-/* 语法高亮内置样式（宝塔/VSCode 暗黑炫彩风格） */
-.token-comment { color: #6a9955; font-style: italic; }
-.token-string { color: #ce9178; }
-.token-keyword { color: #c586c0; font-weight: bold; }
-.token-variable { color: #9cdcfe; }
-.token-number { color: #b5cea8; }
-.token-function { color: #dcdcaa; }
 
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 999; }
 .modal-box { background: #111827; color: #f3f4f6; padding: 20px; border-radius: 12px; width: 600px; max-width: 90%; box-shadow: 0 10px 25px rgba(0,0,0,0.3); font-family: monospace; }
@@ -479,7 +427,7 @@ a { color: inherit; text-decoration: none; }
                     </div>
 
                     <!-- 顶部保存与原子覆盖操作区 -->
-                    <form method="POST" id="editForm">
+                    <form method="POST" id="editForm" onsubmit="syncEditorContent()">
                         <input type="hidden" name="op" value="save_file" id="formOpField">
                         <input type="hidden" name="file_path" value="<?php echo h($editFileReal); ?>">
                         
@@ -491,12 +439,9 @@ a { color: inherit; text-decoration: none; }
                             <button type="submit" class="btn btn-success">💾 直接保存原文件</button>
                         </div>
 
-                        <!-- 真正的高性能单框编辑器容器 -->
-                        <div class="editor-container">
-                            <div id="lineNumbersCol" class="line-numbers-col">1</div>
-                            <div id="editorScrollArea" class="editor-scroll-area" onscroll="syncScrollAll()">
-                                <textarea name="file_content" id="codeEditor" class="code-textarea" oninput="onEditorInput()" onkeydown="handleTab(event)"><?php echo h($editFileContent); ?></textarea>
-                            </div>
+                        <!-- 纯正 CodeMirror 单容器编辑器挂载点 -->
+                        <div style="margin-bottom: 10px;">
+                            <textarea name="file_content" id="codeEditor"><?php echo h($editFileContent); ?></textarea>
                         </div>
                         
                         <!-- 底部保存按钮 -->
@@ -601,73 +546,62 @@ a { color: inherit; text-decoration: none; }
     </div>
 </div>
 
+<!-- 引入 CodeMirror 5 核心库与 PHP 模式支持 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/php/php.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/script/script.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
+
 <script>
-// 动态行号更新
-function updateLineNumbers() {
-    const editor = document.getElementById('codeEditor');
-    const lineNumbersCol = document.getElementById('lineNumbersCol');
-    if (!editor || !lineNumbersCol) return;
-
-    const lines = editor.value.split('\n').length;
-    let lineHtml = '';
-    for (let i = 1; i <= lines; i++) {
-        lineHtml += `<div>${i}</div>`;
-    }
-    lineNumbersCol.innerHTML = lineHtml;
-}
-
-// 同步滚动条
-function syncScrollAll() {
-    const scrollArea = document.getElementById('editorScrollArea');
-    const lineNumbersCol = document.getElementById('lineNumbersCol');
-    if (scrollArea && lineNumbersCol) {
-        lineNumbersCol.scrollTop = scrollArea.scrollTop;
-    }
-}
-
-function onEditorInput() {
-    updateLineNumbers();
-}
-
-// 支持在 textarea 中按 Tab 键缩进
-function handleTab(e) {
-    if (e.key === 'Tab') {
-        e.preventDefault();
-        const start = this.selectionStart;
-        const end = this.selectionEnd;
-        this.value = this.value.substring(0, start) + "    " + this.value.substring(end);
-        this.selectionStart = this.selectionEnd = start + 4;
-        updateLineNumbers();
-    }
-}
+let codeMirrorInstance = null;
 
 window.addEventListener('DOMContentLoaded', () => {
-    if (document.getElementById('codeEditor')) {
-        updateLineNumbers();
+    const textarea = document.getElementById('codeEditor');
+    if (textarea) {
+        // 初始化 CodeMirror 编辑器，完全无重影、无双滚动条，达到宝塔/1Panel级别体验
+        codeMirrorInstance = CodeMirror.fromTextArea(textarea, {
+            lineNumbers: true,
+            mode: "application/x-httpd-php",
+            theme: "dracula",
+            indentUnit: 4,
+            lineWrapping: true,
+            autoCloseBrackets: true
+        });
     }
 });
+
+// 提交表单前将 CodeMirror 的内容同步回底层的 textarea
+function syncEditorContent() {
+    if (codeMirrorInstance) {
+        codeMirrorInstance.save();
+    }
+}
 
 function doFindReplace() {
     const findStr = document.getElementById('findInput').value;
     const replaceStr = document.getElementById('replaceInput').value;
-    const editor = document.getElementById('codeEditor');
-
+    
     if (!findStr) {
         alert('请输入要查找的内容');
         return;
     }
 
-    const content = editor.value;
-    if (content.includes(findStr)) {
-        editor.value = content.split(findStr).join(replaceStr);
-        updateLineNumbers();
-        alert('替换完成！');
-    } else {
-        alert('未在当前文件中找到匹配的内容。');
+    if (codeMirrorInstance) {
+        const content = codeMirrorInstance.getValue();
+        if (content.includes(findStr)) {
+            const newContent = content.split(findStr).join(replaceStr);
+            codeMirrorInstance.setValue(newContent);
+            alert('替换完成！');
+        } else {
+            alert('未在当前文件中找到匹配的内容。');
+        }
     }
 }
 
 function submitAsNew() {
+    syncEditorContent();
     const form = document.getElementById('editForm');
     document.getElementById('formOpField').value = 'save_as_new';
     form.submit();
