@@ -5,15 +5,28 @@ declare(strict_types=1);
 /**
  * AppleCMS OPS - Redis
  *
+ * PHP 7.4+
+ *
  * 自动读取：
  * ../application/extra/maccms.php
  *
- * PHP 7.4+
+ * 功能：
+ * - Redis 连接检测
+ * - Redis Server / Memory / Clients / Stats
+ * - 当前 DB Keys 数量
+ * - Key 搜索
+ * - 通配符搜索
+ * - Key 查看
+ * - Key 删除
+ * - 批量删除搜索结果
+ * - 自动读取 AppleCMS Redis 配置
  */
+
+session_start();
 
 
 /* =========================================================
- * 基础配置
+ * 基础路径
  * ======================================================= */
 
 $APP_ROOT = realpath(__DIR__ . '/..');
@@ -40,16 +53,15 @@ function h($value): string
 
 
 /**
- * 读取 PHP 配置
+ * 安全读取 PHP 配置
  */
-function loadRedisConfig(string $file): array
+function loadPhpConfig(string $file): array
 {
     if (!is_file($file) || !is_readable($file)) {
         return [];
     }
 
     try {
-
         $data = include $file;
 
         return is_array($data) ? $data : [];
@@ -62,9 +74,46 @@ function loadRedisConfig(string $file): array
 
 
 /**
+ * 递归寻找配置
+ *
+ * 与 index.php 使用相同逻辑。
+ */
+function findConfigValue(
+    array $data,
+    string $targetKey,
+    &$found = false
+) {
+    foreach ($data as $key => $value) {
+
+        if ((string)$key === $targetKey) {
+
+            $found = true;
+
+            return $value;
+        }
+
+        if (is_array($value)) {
+
+            $result = findConfigValue(
+                $value,
+                $targetKey,
+                $found
+            );
+
+            if ($found) {
+                return $result;
+            }
+        }
+    }
+
+    return null;
+}
+
+
+/**
  * 隐藏密码
  */
-function maskRedisSecret($value): string
+function maskSecret($value): string
 {
     if ($value === null || $value === '') {
         return '';
@@ -85,12 +134,12 @@ function maskRedisSecret($value): string
 
 
 /**
- * 状态
+ * 状态标签
  */
-function redisStatus(
+function statusBadge(
     bool $ok,
-    string $success = '在线',
-    string $failed = '离线'
+    string $success = '成功连接',
+    string $failed = '连接失败'
 ): string {
 
     if ($ok) {
@@ -99,7 +148,6 @@ function redisStatus(
             . '<span class="dot"></span>'
             . h($success)
             . '</span>';
-
     }
 
     return '<span class="status danger">'
@@ -130,18 +178,25 @@ function formatBytes($bytes): string
 
     $i = 0;
 
-    while ($bytes >= 1024 && $i < count($units) - 1) {
+    while (
+        $bytes >= 1024
+        && $i < count($units) - 1
+    ) {
 
         $bytes /= 1024;
+
         $i++;
     }
 
-    return number_format($bytes, 2) . ' ' . $units[$i];
+    return number_format(
+        $bytes,
+        2
+    ) . ' ' . $units[$i];
 }
 
 
 /**
- * 格式化秒
+ * 格式化时间
  */
 function formatSeconds($seconds): string
 {
@@ -151,15 +206,24 @@ function formatSeconds($seconds): string
         return '0 秒';
     }
 
-    $days = intdiv($seconds, 86400);
+    $days = intdiv(
+        $seconds,
+        86400
+    );
 
     $seconds %= 86400;
 
-    $hours = intdiv($seconds, 3600);
+    $hours = intdiv(
+        $seconds,
+        3600
+    );
 
     $seconds %= 3600;
 
-    $minutes = intdiv($seconds, 60);
+    $minutes = intdiv(
+        $seconds,
+        60
+    );
 
     $seconds %= 60;
 
@@ -181,125 +245,191 @@ function formatSeconds($seconds): string
         $parts[] = $seconds . ' 秒';
     }
 
-    return implode(' ', $parts);
+    return implode(
+        ' ',
+        $parts
+    );
+}
+
+
+/**
+ * 将用户搜索表达式转换为 Redis MATCH
+ *
+ * 支持：
+ * vod*
+ * cache_*
+ * maccms*
+ *
+ * 如果没有通配符，则自动变成：
+ * keyword*
+ */
+function normalizeRedisPattern(
+    string $pattern
+): string {
+
+    $pattern = trim($pattern);
+
+    if ($pattern === '') {
+        return '*';
+    }
+
+    if (
+        strpos($pattern, '*') === false
+        && strpos($pattern, '?') === false
+        && strpos($pattern, '[') === false
+    ) {
+
+        $pattern .= '*';
+    }
+
+    return $pattern;
+}
+
+
+/**
+ * 安全 JSON
+ */
+function jsonSafe($value): string
+{
+    return json_encode(
+        $value,
+        JSON_UNESCAPED_UNICODE
+        | JSON_UNESCAPED_SLASHES
+        | JSON_INVALID_UTF8_SUBSTITUTE
+    ) ?: '{}';
 }
 
 
 /* =========================================================
- * 读取 AppleCMS 配置
+ * AppleCMS 配置
  * ======================================================= */
 
-$maccmsConfig = loadRedisConfig(
+$maccmsConfig = loadPhpConfig(
     $MACCMS_CONFIG
 );
 
-$redisConfig = [];
-
-if (
-    isset($maccmsConfig['meilisearch'])
-    && is_array($maccmsConfig['meilisearch'])
-) {
-
-    /*
-     * 这里不使用 meilisearch 配置。
-     */
-}
-
-
-/*
- * AppleCMS Redis 配置通常位于顶层：
- *
- * cache_host
- * cache_port
- * cache_username
- * cache_password
- * cache_db
- * cache_flag
- * cache_core
- * cache_time
- * cache_page
- * cache_time_page
- */
-
 
 /* =========================================================
- * Redis 参数
+ * Redis 配置
+ *
+ * 这里完全采用 index.php 的读取方式。
  * ======================================================= */
 
-$redisHost = '';
-
-$redisPort = 6379;
-
-$redisUsername = '';
-
-$redisPassword = '';
-
-$redisDb = 0;
-
-$redisFlag = '';
-
-$redisCore = '';
-
-$redisCacheTime = '';
-
-$redisCachePage = '';
-
-$redisCacheTimePage = '';
+$redisHostFound = false;
+$redisPortFound = false;
+$redisUsernameFound = false;
+$redisPasswordFound = false;
+$redisDbFound = false;
+$redisFlagFound = false;
+$redisCoreFound = false;
+$redisTimeFound = false;
+$redisPageFound = false;
+$redisTimePageFound = false;
 
 
-if (array_key_exists('cache_host', $maccmsConfig)) {
+$redisHost = findConfigValue(
+    $maccmsConfig,
+    'cache_host',
+    $redisHostFound
+);
 
-    $redisHost = (string)$maccmsConfig['cache_host'];
+
+$redisPort = findConfigValue(
+    $maccmsConfig,
+    'cache_port',
+    $redisPortFound
+);
+
+
+$redisUsername = findConfigValue(
+    $maccmsConfig,
+    'cache_username',
+    $redisUsernameFound
+);
+
+
+$redisPassword = findConfigValue(
+    $maccmsConfig,
+    'cache_password',
+    $redisPasswordFound
+);
+
+
+$redisDb = findConfigValue(
+    $maccmsConfig,
+    'cache_db',
+    $redisDbFound
+);
+
+
+$redisFlag = findConfigValue(
+    $maccmsConfig,
+    'cache_flag',
+    $redisFlagFound
+);
+
+
+$redisCore = findConfigValue(
+    $maccmsConfig,
+    'cache_core',
+    $redisCoreFound
+);
+
+
+$redisCacheTime = findConfigValue(
+    $maccmsConfig,
+    'cache_time',
+    $redisTimeFound
+);
+
+
+$redisCachePage = findConfigValue(
+    $maccmsConfig,
+    'cache_page',
+    $redisPageFound
+);
+
+
+$redisCacheTimePage = findConfigValue(
+    $maccmsConfig,
+    'cache_time_page',
+    $redisTimePageFound
+);
+
+
+/* 默认值 */
+
+if (
+    !$redisPortFound
+    || !$redisPort
+) {
+    $redisPort = 6379;
 }
 
-if (array_key_exists('cache_port', $maccmsConfig)) {
 
-    $redisPort = (int)$maccmsConfig['cache_port'];
+if (
+    !$redisDbFound
+    || $redisDb === ''
+) {
+    $redisDb = 0;
 }
 
-if (array_key_exists('cache_username', $maccmsConfig)) {
 
-    $redisUsername = (string)$maccmsConfig['cache_username'];
-}
+$redisHost = (string)($redisHost ?? '');
+$redisUsername = (string)($redisUsername ?? '');
+$redisPassword = (string)($redisPassword ?? '');
+$redisFlag = (string)($redisFlag ?? '');
+$redisCore = (string)($redisCore ?? '');
+$redisCacheTime = (string)($redisCacheTime ?? '');
+$redisCachePage = (string)($redisCachePage ?? '');
+$redisCacheTimePage = (string)($redisCacheTimePage ?? '');
 
-if (array_key_exists('cache_password', $maccmsConfig)) {
-
-    $redisPassword = (string)$maccmsConfig['cache_password'];
-}
-
-if (array_key_exists('cache_db', $maccmsConfig)) {
-
-    $redisDb = (int)$maccmsConfig['cache_db'];
-}
-
-if (array_key_exists('cache_flag', $maccmsConfig)) {
-
-    $redisFlag = (string)$maccmsConfig['cache_flag'];
-}
-
-if (array_key_exists('cache_core', $maccmsConfig)) {
-
-    $redisCore = (string)$maccmsConfig['cache_core'];
-}
-
-if (array_key_exists('cache_time', $maccmsConfig)) {
-
-    $redisCacheTime = (string)$maccmsConfig['cache_time'];
-}
-
-if (array_key_exists('cache_page', $maccmsConfig)) {
-
-    $redisCachePage = (string)$maccmsConfig['cache_page'];
-}
-
-if (array_key_exists('cache_time_page', $maccmsConfig)) {
-
-    $redisCacheTimePage = (string)$maccmsConfig['cache_time_page'];
-}
+$redisPort = (int)$redisPort;
+$redisDb = (int)$redisDb;
 
 
 /* =========================================================
- * Redis 状态
+ * Redis 基础变量
  * ======================================================= */
 
 $redisExtensionAvailable = class_exists('Redis');
@@ -310,50 +440,49 @@ $redisError = '';
 
 $redis = null;
 
-
-/* =========================================================
- * Redis 数据
- * ======================================================= */
-
 $redisServerInfo = [];
-
 $redisMemoryInfo = [];
-
 $redisStats = [];
-
 $redisClientsInfo = [];
 
-$redisKeyspace = [];
-
-$redisDatabaseCount = 0;
-
-$redisTotalKeys = 0;
-
-$redisHitRate = 0;
-
-$redisHits = 0;
-
-$redisMisses = 0;
-
 $redisVersion = '-';
-
 $redisMode = '-';
-
 $redisUptime = 0;
 
 $redisUsedMemory = 0;
-
 $redisPeakMemory = 0;
-
 $redisMaxMemory = 0;
 
 $redisConnectedClients = 0;
-
 $redisBlockedClients = 0;
 
 $redisCommandsProcessed = 0;
-
 $redisOpsPerSecond = 0;
+
+$redisHits = 0;
+$redisMisses = 0;
+$redisHitRate = 0;
+
+$redisTotalKeys = 0;
+$redisDatabaseCount = 0;
+
+$redisDatabaseTotalKeys = 0;
+
+$redisKeyList = [];
+
+$redisKeySearch = '';
+$redisKeyPattern = '';
+$redisKeyError = '';
+
+$redisActionMessage = '';
+$redisActionType = '';
+
+$redisSelectedKey = '';
+$redisSelectedValue = null;
+
+$currentTime = date(
+    'Y-m-d H:i:s'
+);
 
 
 /* =========================================================
@@ -374,14 +503,16 @@ if (!$redisExtensionAvailable) {
 
         $redis = new Redis();
 
-        $connectStart = microtime(true);
-
         $redis->connect(
             $redisHost,
             $redisPort,
             1.5
         );
 
+
+        /*
+         * Redis ACL
+         */
         if ($redisPassword !== '') {
 
             if ($redisUsername !== '') {
@@ -399,10 +530,18 @@ if (!$redisExtensionAvailable) {
             }
         }
 
+
+        /*
+         * 选择 AppleCMS 配置的 DB
+         */
         $redis->select(
             $redisDb
         );
 
+
+        /*
+         * PING
+         */
         $pong = $redis->ping();
 
         if ($pong === false) {
@@ -412,178 +551,724 @@ if (!$redisExtensionAvailable) {
             );
         }
 
+
         $redisConnected = true;
 
-        /*
-         * Server
-         */
+
+        /* =================================================
+         * Redis Server
+         * ================================================= */
+
         $redisServerInfo = $redis->info(
             'server'
         );
 
-        /*
-         * Memory
-         */
+
+        /* =================================================
+         * Redis Memory
+         * ================================================= */
+
         $redisMemoryInfo = $redis->info(
             'memory'
         );
 
-        /*
-         * Stats
-         */
+
+        /* =================================================
+         * Redis Stats
+         * ================================================= */
+
         $redisStats = $redis->info(
             'stats'
         );
 
-        /*
-         * Clients
-         */
+
+        /* =================================================
+         * Redis Clients
+         * ================================================= */
+
         $redisClientsInfo = $redis->info(
             'clients'
         );
 
-        /*
-         * Keyspace
-         */
-        $redisKeyspace = $redis->info(
-            'keyspace'
-        );
 
-        if (isset($redisServerInfo['redis_version'])) {
+        /*
+         * Server Version
+         */
+
+        if (
+            isset(
+                $redisServerInfo['redis_version']
+            )
+        ) {
 
             $redisVersion =
                 (string)$redisServerInfo['redis_version'];
         }
 
-        if (isset($redisServerInfo['uptime_in_seconds'])) {
 
-            $redisUptime =
-                (int)$redisServerInfo['uptime_in_seconds'];
-        }
+        /*
+         * Mode
+         */
 
-        if (isset($redisServerInfo['redis_mode'])) {
+        if (
+            isset(
+                $redisServerInfo['redis_mode']
+            )
+        ) {
 
             $redisMode =
                 (string)$redisServerInfo['redis_mode'];
 
-        } elseif (isset($redisServerInfo['role'])) {
+        } elseif (
+            isset(
+                $redisServerInfo['role']
+            )
+        ) {
 
             $redisMode =
                 (string)$redisServerInfo['role'];
         }
 
+
         /*
-         * Memory
+         * Uptime
          */
 
-        if (isset($redisMemoryInfo['used_memory'])) {
+        if (
+            isset(
+                $redisServerInfo['uptime_in_seconds']
+            )
+        ) {
+
+            $redisUptime =
+                (int)$redisServerInfo['uptime_in_seconds'];
+        }
+
+
+        /* =================================================
+         * Memory
+         * ================================================= */
+
+        if (
+            isset(
+                $redisMemoryInfo['used_memory']
+            )
+        ) {
 
             $redisUsedMemory =
                 (int)$redisMemoryInfo['used_memory'];
         }
 
-        if (isset($redisMemoryInfo['used_memory_peak'])) {
+
+        if (
+            isset(
+                $redisMemoryInfo['used_memory_peak']
+            )
+        ) {
 
             $redisPeakMemory =
                 (int)$redisMemoryInfo['used_memory_peak'];
         }
 
-        if (isset($redisMemoryInfo['maxmemory'])) {
+
+        if (
+            isset(
+                $redisMemoryInfo['maxmemory']
+            )
+        ) {
 
             $redisMaxMemory =
                 (int)$redisMemoryInfo['maxmemory'];
         }
 
-        /*
-         * Clients
-         */
 
-        if (isset($redisClientsInfo['connected_clients'])) {
+        /* =================================================
+         * Clients
+         * ================================================= */
+
+        if (
+            isset(
+                $redisClientsInfo['connected_clients']
+            )
+        ) {
 
             $redisConnectedClients =
                 (int)$redisClientsInfo['connected_clients'];
         }
 
-        if (isset($redisClientsInfo['blocked_clients'])) {
+
+        if (
+            isset(
+                $redisClientsInfo['blocked_clients']
+            )
+        ) {
 
             $redisBlockedClients =
                 (int)$redisClientsInfo['blocked_clients'];
         }
 
-        /*
-         * Stats
-         */
 
-        if (isset($redisStats['keyspace_hits'])) {
+        /* =================================================
+         * Stats
+         * ================================================= */
+
+        if (
+            isset(
+                $redisStats['keyspace_hits']
+            )
+        ) {
 
             $redisHits =
                 (int)$redisStats['keyspace_hits'];
         }
 
-        if (isset($redisStats['keyspace_misses'])) {
+
+        if (
+            isset(
+                $redisStats['keyspace_misses']
+            )
+        ) {
 
             $redisMisses =
                 (int)$redisStats['keyspace_misses'];
         }
 
-        if (
-            isset($redisStats['instantaneous_ops_per_sec'])
-        ) {
-
-            $redisOpsPerSecond =
-                (int)$redisStats['instantaneous_ops_per_sec'];
-        }
 
         if (
-            isset($redisStats['total_commands_processed'])
+            isset(
+                $redisStats['total_commands_processed']
+            )
         ) {
 
             $redisCommandsProcessed =
                 (int)$redisStats['total_commands_processed'];
         }
 
+
+        if (
+            isset(
+                $redisStats['instantaneous_ops_per_sec']
+            )
+        ) {
+
+            $redisOpsPerSecond =
+                (int)$redisStats['instantaneous_ops_per_sec'];
+        }
+
+
         /*
          * Hit Rate
          */
 
-        $totalHitsMisses =
+        $hitMissTotal =
             $redisHits + $redisMisses;
 
-        if ($totalHitsMisses > 0) {
+        if ($hitMissTotal > 0) {
 
             $redisHitRate =
-                ($redisHits / $totalHitsMisses) * 100;
+                ($redisHits / $hitMissTotal) * 100;
         }
 
+
+        /* =================================================
+         * 关键修复：
+         *
+         * 不再通过 INFO keyspace 判断当前 DB Keys。
+         *
+         * 直接 DBSIZE。
+         * ================================================= */
+
+        $redisDatabaseTotalKeys =
+            (int)$redis->dbSize();
+
+
+        $redisTotalKeys =
+            $redisDatabaseTotalKeys;
+
+
         /*
-         * Keyspace
+         * Redis 默认 database 数量
          */
 
-        if (is_array($redisKeyspace)) {
+        try {
 
-            foreach ($redisKeyspace as $dbName => $dbInfo) {
+            $databaseConfig =
+                $redis->config(
+                    'GET',
+                    'databases'
+                );
+
+            if (
+                is_array($databaseConfig)
+                && isset(
+                    $databaseConfig['databases']
+                )
+            ) {
+
+                $redisDatabaseCount =
+                    (int)$databaseConfig['databases'];
+            }
+
+        } catch (Throwable $e) {
+
+            $redisDatabaseCount = 0;
+        }
+
+
+        /* =================================================
+         * Key 管理
+         * ================================================= */
+
+        if (
+            isset($_GET['key'])
+        ) {
+
+            $redisKeySearch =
+                trim(
+                    (string)$_GET['key']
+                );
+
+        } else {
+
+            /*
+             * 默认使用 AppleCMS cache_flag
+             *
+             * 例如：
+             * axxx
+             *
+             * 自动变成：
+             * axxx*
+             */
+
+            $redisKeySearch =
+                trim($redisFlag);
+        }
+
+
+        $redisKeyPattern =
+            normalizeRedisPattern(
+                $redisKeySearch
+            );
+
+
+        /* =================================================
+         * 删除单个 Key
+         * ================================================= */
+
+        if (
+            $_SERVER['REQUEST_METHOD'] === 'POST'
+            && isset($_POST['action'])
+            && $_POST['action'] === 'delete_key'
+        ) {
+
+            $deleteKey =
+                isset($_POST['key'])
+                    ? (string)$_POST['key']
+                    : '';
+
+            $deleteKey =
+                trim($deleteKey);
+
+            if ($deleteKey === '') {
+
+                $redisActionMessage =
+                    '未指定 Key';
+
+                $redisActionType =
+                    'danger';
+
+            } else {
+
+                try {
+
+                    $deleted =
+                        $redis->del(
+                            $deleteKey
+                        );
+
+                    if ($deleted > 0) {
+
+                        $redisActionMessage =
+                            'Key 已删除：'
+                            . $deleteKey;
+
+                        $redisActionType =
+                            'success';
+
+                    } else {
+
+                        $redisActionMessage =
+                            'Key 不存在：'
+                            . $deleteKey;
+
+                        $redisActionType =
+                            'warning';
+                    }
+
+                } catch (Throwable $e) {
+
+                    $redisActionMessage =
+                        '删除失败：'
+                        . $e->getMessage();
+
+                    $redisActionType =
+                        'danger';
+                }
+            }
+
+
+            /*
+             * 防止刷新重复提交
+             */
+            $redirect =
+                strtok(
+                    $_SERVER['REQUEST_URI'],
+                    '?'
+                );
+
+            $query = [];
+
+            if ($redisKeySearch !== '') {
+
+                $query['key'] =
+                    $redisKeySearch;
+            }
+
+            if ($redisActionMessage !== '') {
+
+                $query['message'] =
+                    $redisActionMessage;
+
+                $query['type'] =
+                    $redisActionType;
+            }
+
+            if (!empty($query)) {
+
+                $redirect .=
+                    '?' . http_build_query($query);
+            }
+
+            header(
+                'Location: ' . $redirect
+            );
+
+            exit;
+        }
+
+
+        /* =================================================
+         * 批量删除当前搜索结果
+         * ================================================= */
+
+        if (
+            $_SERVER['REQUEST_METHOD'] === 'POST'
+            && isset($_POST['action'])
+            && $_POST['action'] === 'delete_search'
+        ) {
+
+            $deletePattern =
+                isset($_POST['pattern'])
+                    ? trim((string)$_POST['pattern'])
+                    : '';
+
+
+            if ($deletePattern === '') {
+
+                $redisActionMessage =
+                    '搜索条件为空';
+
+                $redisActionType =
+                    'danger';
+
+            } else {
+
+                $deleteCount = 0;
+
+                $iterator = null;
+
+                try {
+
+                    do {
+
+                        $keys =
+                            $redis->scan(
+                                $iterator,
+                                $deletePattern,
+                                500
+                            );
+
+                        if (
+                            $keys === false
+                        ) {
+                            break;
+                        }
+
+
+                        if (
+                            is_array($keys)
+                            && !empty($keys)
+                        ) {
+
+                            $deleteCount +=
+                                (int)$redis->del(
+                                    $keys
+                                );
+                        }
+
+                    } while (
+                        $iterator !== 0
+                    );
+
+
+                    $redisActionMessage =
+                        '已删除 '
+                        . $deleteCount
+                        . ' 个 Key';
+
+                    $redisActionType =
+                        'success';
+
+                } catch (Throwable $e) {
+
+                    $redisActionMessage =
+                        '批量删除失败：'
+                        . $e->getMessage();
+
+                    $redisActionType =
+                        'danger';
+                }
+            }
+
+
+            $redirect =
+                strtok(
+                    $_SERVER['REQUEST_URI'],
+                    '?'
+                );
+
+            $query = [];
+
+            if ($redisKeySearch !== '') {
+
+                $query['key'] =
+                    $redisKeySearch;
+            }
+
+            if ($redisActionMessage !== '') {
+
+                $query['message'] =
+                    $redisActionMessage;
+
+                $query['type'] =
+                    $redisActionType;
+            }
+
+            if (!empty($query)) {
+
+                $redirect .=
+                    '?' . http_build_query($query);
+            }
+
+            header(
+                'Location: ' . $redirect
+            );
+
+            exit;
+        }
+
+
+        /* =================================================
+         * GET 操作提示
+         * ================================================= */
+
+        if (
+            isset($_GET['message'])
+        ) {
+
+            $redisActionMessage =
+                (string)$_GET['message'];
+
+            $redisActionType =
+                isset($_GET['type'])
+                    ? (string)$_GET['type']
+                    : 'success';
+        }
+
+
+        /* =================================================
+         * Key 搜索
+         * ================================================= */
+
+        if (
+            $redisKeyPattern !== ''
+        ) {
+
+            $iterator = null;
+
+            $maxKeys = 500;
+
+            do {
+
+                $keys =
+                    $redis->scan(
+                        $iterator,
+                        $redisKeyPattern,
+                        200
+                    );
 
                 if (
-                    strpos(
-                        (string)$dbName,
-                        'db'
-                    ) !== 0
+                    $keys === false
                 ) {
-                    continue;
+                    break;
                 }
 
+
                 if (
-                    is_array($dbInfo)
-                    && isset($dbInfo['keys'])
+                    is_array($keys)
                 ) {
 
-                    $redisTotalKeys +=
-                        (int)$dbInfo['keys'];
+                    foreach ($keys as $key) {
 
-                    $redisDatabaseCount++;
+                        $redisKeyList[] =
+                            (string)$key;
+
+                        if (
+                            count($redisKeyList)
+                            >= $maxKeys
+                        ) {
+
+                            break 2;
+                        }
+                    }
+                }
+
+            } while (
+                $iterator !== 0
+            );
+
+
+            /*
+             * 排序
+             */
+            sort(
+                $redisKeyList,
+                SORT_STRING
+            );
+        }
+
+
+        /* =================================================
+         * 查看指定 Key
+         * ================================================= */
+
+        if (
+            isset($_GET['view'])
+        ) {
+
+            $redisSelectedKey =
+                (string)$_GET['view'];
+
+
+            if (
+                $redisSelectedKey !== ''
+            ) {
+
+                try {
+
+                    $type =
+                        $redis->type(
+                            $redisSelectedKey
+                        );
+
+
+                    switch ($type) {
+
+                        case Redis::REDIS_STRING:
+
+                            $redisSelectedValue =
+                                $redis->get(
+                                    $redisSelectedKey
+                                );
+
+                            break;
+
+
+                        case Redis::REDIS_LIST:
+
+                            $redisSelectedValue =
+                                $redis->lRange(
+                                    $redisSelectedKey,
+                                    0,
+                                    99
+                                );
+
+                            break;
+
+
+                        case Redis::REDIS_SET:
+
+                            $redisSelectedValue =
+                                $redis->sMembers(
+                                    $redisSelectedKey
+                                );
+
+                            break;
+
+
+                        case Redis::REDIS_ZSET:
+
+                            $redisSelectedValue =
+                                $redis->zRange(
+                                    $redisSelectedKey,
+                                    0,
+                                    99,
+                                    true
+                                );
+
+                            break;
+
+
+                        case Redis::REDIS_HASH:
+
+                            $redisSelectedValue =
+                                $redis->hGetAll(
+                                    $redisSelectedKey
+                                );
+
+                            break;
+
+
+                        case Redis::REDIS_STREAM:
+
+                            $redisSelectedValue =
+                                $redis->xRange(
+                                    $redisSelectedKey,
+                                    '-',
+                                    '+',
+                                    100
+                                );
+
+                            break;
+
+
+                        default:
+
+                            $redisSelectedValue =
+                                null;
+
+                            break;
+                    }
+
+                } catch (Throwable $e) {
+
+                    $redisSelectedValue =
+                        '读取失败：'
+                        . $e->getMessage();
                 }
             }
         }
+
 
     } catch (Throwable $e) {
 
@@ -592,7 +1277,9 @@ if (!$redisExtensionAvailable) {
         $redisError =
             $e->getMessage();
 
-        if ($redisError === '') {
+        if (
+            $redisError === ''
+        ) {
 
             $redisError =
                 'Redis 连接异常';
@@ -602,15 +1289,33 @@ if (!$redisExtensionAvailable) {
 
 
 /* =========================================================
- * 当前时间
+ * 页面状态
  * ======================================================= */
 
-$currentTime = date(
-    'Y-m-d H:i:s'
-);
+$redisStatusText =
+    $redisConnected
+        ? '在线'
+        : '离线';
 
+
+$redisConnectionText =
+    $redisConnected
+        ? '正常'
+        : '异常';
+
+
+$redisConfigRead =
+    $redisHostFound
+    && trim($redisHost) !== '';
+
+
+/* =========================================================
+ * HTML
+ * ======================================================= */
 ?>
+
 <!DOCTYPE html>
+
 <html lang="zh-CN">
 
 <head>
@@ -622,9 +1327,16 @@ $currentTime = date(
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>Redis - AppleCMS OPS</title>
+<title>
+    Redis - AppleCMS OPS
+</title>
+
 
 <style>
+
+/* =========================================================
+ * Base
+ * ======================================================= */
 
 * {
     box-sizing: border-box;
@@ -634,6 +1346,7 @@ html,
 body {
     margin: 0;
     padding: 0;
+    min-height: 100%;
 }
 
 body {
@@ -643,6 +1356,7 @@ body {
         BlinkMacSystemFont,
         "Segoe UI",
         Roboto,
+        "Helvetica Neue",
         Arial,
         "PingFang SC",
         "Microsoft YaHei",
@@ -654,9 +1368,19 @@ body {
 }
 
 a {
-    text-decoration: none;
     color: inherit;
+    text-decoration: none;
 }
+
+button,
+input {
+    font-family: inherit;
+}
+
+
+/* =========================================================
+ * App
+ * ======================================================= */
 
 .app {
 
@@ -686,7 +1410,7 @@ a {
 
     padding: 22px 14px;
 
-    z-index: 10;
+    z-index: 20;
 }
 
 .logo {
@@ -749,6 +1473,10 @@ a {
     color: #cbd5e1;
 
     font-size: 14px;
+
+    transition:
+        background .15s,
+        color .15s;
 }
 
 .menu-item:hover {
@@ -770,6 +1498,12 @@ a {
     width: 22px;
 
     text-align: center;
+
+    flex: 0 0 22px;
+}
+
+.menu-text {
+    white-space: nowrap;
 }
 
 
@@ -781,15 +1515,19 @@ a {
 
     margin-left: 240px;
 
-    width:
-        calc(100% - 240px);
+    width: calc(100% - 240px);
 
     min-height: 100vh;
 }
 
+
+/* =========================================================
+ * Top Bar
+ * ======================================================= */
+
 .topbar {
 
-    height: 70px;
+    height: 64px;
 
     background: #fff;
 
@@ -805,56 +1543,96 @@ a {
     padding:
         0
         30px;
+
+    position: sticky;
+
+    top: 0;
+
+    z-index: 10;
 }
 
 .top-title {
 
-    font-size: 19px;
+    font-size: 16px;
 
-    font-weight: 700;
+    font-weight: 600;
 }
 
 .top-right {
 
-    color: #64748b;
+    color: #6b7280;
 
     font-size: 13px;
 }
 
-.content {
-
-    padding: 28px;
-
-    max-width: 1500px;
-}
-
 
 /* =========================================================
- * Header
+ * Content
  * ======================================================= */
 
-.page-header {
+.content {
 
-    margin-bottom: 24px;
+    padding: 30px;
 }
 
-.page-header h1 {
+.page-head {
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 20px;
+
+    margin-bottom: 22px;
+}
+
+.page-title h1 {
 
     margin: 0;
 
-    font-size: 25px;
+    font-size: 26px;
+
+    line-height: 1.3;
 }
 
-.page-header p {
-
-    color: #64748b;
+.page-title p {
 
     margin:
         7px
         0
         0;
 
+    color: #6b7280;
+
     font-size: 13px;
+}
+
+.refresh {
+
+    border: 0;
+
+    background: #fff;
+
+    color: #374151;
+
+    border:
+        1px solid #dbe0e8;
+
+    border-radius: 8px;
+
+    padding:
+        9px
+        14px;
+
+    cursor: pointer;
+
+    font-size: 13px;
+}
+
+.refresh:hover {
+    background: #f9fafb;
 }
 
 
@@ -862,43 +1640,26 @@ a {
  * Cards
  * ======================================================= */
 
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(
-                250px,
-                1fr
-            )
-        );
-
-    gap: 18px;
-
-    margin-bottom: 18px;
-}
-
 .card {
 
     background: #fff;
 
     border:
-        1px solid #e5e7eb;
+        1px solid #e6eaf0;
 
-    border-radius: 14px;
+    border-radius: 12px;
 
     padding: 20px;
 
     box-shadow:
-        0 2px 7px
-        rgba(
+        0 2px 8px rgba(
             15,
             23,
             42,
             .03
         );
+
+    margin-bottom: 18px;
 }
 
 .card-title {
@@ -911,71 +1672,16 @@ a {
 
     gap: 15px;
 
-    margin-bottom: 18px;
+    margin-bottom: 17px;
 }
 
 .card-title h3 {
 
     margin: 0;
 
-    font-size: 16px;
-}
-
-.big-value {
-
-    font-size: 27px;
-
-    font-weight: 700;
-
-    margin-top: 5px;
-}
-
-.sub-value {
-
-    margin-top: 5px;
-
-    color: #64748b;
-
-    font-size: 12px;
-}
-
-.info-row {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    align-items: center;
-
-    gap: 20px;
-
-    padding:
-        9px
-        0;
-
-    border-bottom:
-        1px solid #f1f5f9;
-
-    font-size: 13px;
-}
-
-.info-row:last-child {
-
-    border-bottom: 0;
-}
-
-.info-label {
-
-    color: #64748b;
-}
-
-.info-value {
+    font-size: 15px;
 
     font-weight: 600;
-
-    text-align: right;
-
-    word-break: break-all;
 }
 
 
@@ -989,93 +1695,262 @@ a {
 
     align-items: center;
 
-    gap: 6px;
+    gap: 7px;
 
     font-size: 12px;
 
-    font-weight: 700;
+    white-space: nowrap;
 }
 
-.status .dot {
+.status.success {
+    color: #16a34a;
+}
+
+.status.danger {
+    color: #dc2626;
+}
+
+.status.warning {
+    color: #d97706;
+}
+
+.dot {
 
     width: 7px;
 
     height: 7px;
 
     border-radius: 50%;
-}
 
-.status.success {
-
-    color: #16a34a;
-}
-
-.status.success .dot {
-
-    background: #22c55e;
-
-    box-shadow:
-        0 0 0 3px
-        #dcfce7;
-}
-
-.status.danger {
-
-    color: #dc2626;
-}
-
-.status.danger .dot {
-
-    background: #ef4444;
-
-    box-shadow:
-        0 0 0 3px
-        #fee2e2;
+    background: currentColor;
 }
 
 
 /* =========================================================
- * Alert
+ * Connection Summary
  * ======================================================= */
 
-.alert {
+.connection-card {
 
-    background: #fff1f2;
+    display: grid;
 
-    border:
-        1px solid #fecdd3;
+    grid-template-columns:
+        minmax(220px, 1fr)
+        minmax(300px, 1.5fr);
 
-    color: #be123c;
-
-    padding:
-        13px
-        15px;
-
-    border-radius: 9px;
-
-    margin-bottom: 18px;
-
-    font-size: 13px;
+    gap: 25px;
 }
 
-.success-box {
+.connection-status {
 
-    background: #f0fdf4;
+    padding-right: 25px;
 
-    border:
-        1px solid #bbf7d0;
+    border-right:
+        1px solid #edf0f4;
+}
 
-    color: #15803d;
+.connection-status h2 {
 
-    padding:
-        13px
-        15px;
+    margin:
+        0
+        0
+        7px;
 
-    border-radius: 9px;
+    font-size: 18px;
+}
 
-    margin-bottom: 18px;
+.connection-status p {
+
+    margin: 0;
+
+    color: #6b7280;
 
     font-size: 13px;
+
+    line-height: 1.7;
+}
+
+.config-mini {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(3, minmax(100px, 1fr));
+
+    gap: 12px 22px;
+}
+
+.mini-item {
+
+    min-width: 0;
+}
+
+.mini-label {
+
+    display: block;
+
+    color: #8a94a6;
+
+    font-size: 11px;
+
+    margin-bottom: 4px;
+}
+
+.mini-value {
+
+    display: block;
+
+    color: #172033;
+
+    font-size: 13px;
+
+    font-weight: 500;
+
+    word-break: break-all;
+}
+
+
+/* =========================================================
+ * Stats Grid
+ * ======================================================= */
+
+.stats-grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            4,
+            minmax(
+                0,
+                1fr
+            )
+        );
+
+    gap: 18px;
+
+    margin-bottom: 18px;
+}
+
+.stat-card {
+
+    min-width: 0;
+
+    background: #fff;
+
+    border:
+        1px solid #e6eaf0;
+
+    border-radius: 12px;
+
+    padding: 18px 20px;
+
+    box-shadow:
+        0 2px 8px rgba(
+            15,
+            23,
+            42,
+            .03
+        );
+}
+
+.stat-title {
+
+    color: #6b7280;
+
+    font-size: 12px;
+
+    margin-bottom: 10px;
+}
+
+.big-value {
+
+    font-size: 24px;
+
+    font-weight: 700;
+
+    line-height: 1.25;
+
+    word-break: break-word;
+}
+
+.sub-value {
+
+    color: #8a94a6;
+
+    font-size: 12px;
+
+    margin-top: 6px;
+
+    line-height: 1.6;
+}
+
+
+/* =========================================================
+ * Grid
+ * ======================================================= */
+
+.grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            2,
+            minmax(
+                0,
+                1fr
+            )
+        );
+
+    gap: 18px;
+
+    margin-bottom: 18px;
+}
+
+
+/* =========================================================
+ * Info Rows
+ * ======================================================= */
+
+.info-row {
+
+    min-height: 39px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 20px;
+
+    border-bottom:
+        1px solid #f0f2f5;
+}
+
+.info-row:last-child {
+    border-bottom: 0;
+}
+
+.info-label {
+
+    color: #7b8494;
+
+    font-size: 12px;
+}
+
+.info-value {
+
+    color: #172033;
+
+    font-size: 13px;
+
+    font-weight: 500;
+
+    text-align: right;
+
+    word-break: break-all;
 }
 
 
@@ -1085,15 +1960,15 @@ a {
 
 .progress {
 
-    height: 8px;
+    height: 7px;
 
-    background: #e5e7eb;
+    background: #edf0f5;
 
-    border-radius: 20px;
+    border-radius: 10px;
 
     overflow: hidden;
 
-    margin-top: 12px;
+    margin-top: 15px;
 }
 
 .progress-bar {
@@ -1102,45 +1977,343 @@ a {
 
     background: #2563eb;
 
-    border-radius: 20px;
-
-    transition: width .3s;
+    border-radius: 10px;
 }
 
 
 /* =========================================================
- * Refresh
+ * Key Manager
  * ======================================================= */
 
-.refresh {
+.key-manager {
 
-    display: inline-flex;
+    margin-bottom: 20px;
+}
+
+.key-search-row {
+
+    display: flex;
+
+    gap: 10px;
 
     align-items: center;
+}
 
-    gap: 7px;
+.key-search {
 
-    padding:
-        8px
-        12px;
+    flex: 1;
 
-    background: #fff;
+    min-width: 0;
+
+    height: 42px;
 
     border:
-        1px solid #e5e7eb;
+        1px solid #d9dee7;
 
     border-radius: 8px;
 
-    font-size: 12px;
+    padding:
+        0
+        13px;
 
-    color: #475569;
+    outline: none;
 
-    cursor: pointer;
+    font-size: 13px;
+
+    color: #172033;
+
+    background: #fff;
 }
 
-.refresh:hover {
+.key-search:focus {
+
+    border-color: #2563eb;
+
+    box-shadow:
+        0 0 0 3px
+        rgba(
+            37,
+            99,
+            235,
+            .08
+        );
+}
+
+.btn {
+
+    height: 42px;
+
+    border: 0;
+
+    border-radius: 8px;
+
+    padding:
+        0
+        15px;
+
+    cursor: pointer;
+
+    font-size: 13px;
+
+    white-space: nowrap;
+}
+
+.btn-primary {
+
+    background: #2563eb;
+
+    color: #fff;
+}
+
+.btn-primary:hover {
+    background: #1d4ed8;
+}
+
+.btn-danger {
+
+    background: #dc2626;
+
+    color: #fff;
+}
+
+.btn-danger:hover {
+    background: #b91c1c;
+}
+
+.btn-light {
+
+    background: #f3f4f6;
+
+    color: #374151;
+}
+
+.btn-light:hover {
+    background: #e5e7eb;
+}
+
+.key-hint {
+
+    margin-top: 9px;
+
+    color: #8a94a6;
+
+    font-size: 11px;
+}
+
+.key-actions {
+
+    display: flex;
+
+    gap: 8px;
+
+    align-items: center;
+}
+
+
+/* =========================================================
+ * Alerts
+ * ======================================================= */
+
+.alert {
+
+    border-radius: 9px;
+
+    padding:
+        12px
+        14px;
+
+    margin-bottom: 16px;
+
+    font-size: 13px;
+}
+
+.alert.success {
+
+    background: #ecfdf3;
+
+    color: #166534;
+
+    border:
+        1px solid #bbf7d0;
+}
+
+.alert.danger {
+
+    background: #fef2f2;
+
+    color: #991b1b;
+
+    border:
+        1px solid #fecaca;
+}
+
+.alert.warning {
+
+    background: #fffbeb;
+
+    color: #92400e;
+
+    border:
+        1px solid #fde68a;
+}
+
+
+/* =========================================================
+ * Key Table
+ * ======================================================= */
+
+.key-table-wrap {
+
+    overflow-x: auto;
+
+    border:
+        1px solid #edf0f4;
+
+    border-radius: 9px;
+}
+
+.key-table {
+
+    width: 100%;
+
+    border-collapse: collapse;
+
+    min-width: 650px;
+}
+
+.key-table th {
 
     background: #f8fafc;
+
+    color: #6b7280;
+
+    font-size: 11px;
+
+    font-weight: 600;
+
+    text-align: left;
+
+    padding:
+        11px
+        13px;
+
+    border-bottom:
+        1px solid #e5e7eb;
+}
+
+.key-table td {
+
+    padding:
+        11px
+        13px;
+
+    border-bottom:
+        1px solid #f0f2f5;
+
+    font-size: 12px;
+
+    vertical-align: middle;
+}
+
+.key-table tr:last-child td {
+    border-bottom: 0;
+}
+
+.key-name {
+
+    color: #1f2937;
+
+    font-family:
+        ui-monospace,
+        SFMono-Regular,
+        Menlo,
+        Monaco,
+        Consolas,
+        monospace;
+
+    word-break: break-all;
+}
+
+.key-type {
+
+    color: #64748b;
+}
+
+.key-ttl {
+
+    color: #64748b;
+
+    white-space: nowrap;
+}
+
+.empty {
+
+    padding: 35px 20px;
+
+    text-align: center;
+
+    color: #9ca3af;
+
+    font-size: 13px;
+}
+
+
+/* =========================================================
+ * Key Detail
+ * ======================================================= */
+
+.key-value {
+
+    margin-top: 15px;
+
+    background: #0f172a;
+
+    color: #e2e8f0;
+
+    border-radius: 9px;
+
+    padding: 16px;
+
+    overflow: auto;
+
+    max-height: 420px;
+
+    font-family:
+        ui-monospace,
+        SFMono-Regular,
+        Menlo,
+        Monaco,
+        Consolas,
+        monospace;
+
+    font-size: 12px;
+
+    line-height: 1.7;
+
+    white-space: pre-wrap;
+
+    word-break: break-word;
+}
+
+
+/* =========================================================
+ * Runtime
+ * ======================================================= */
+
+.runtime-grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            4,
+            minmax(
+                0,
+                1fr
+            )
+        );
+
+    gap: 15px;
 }
 
 
@@ -1148,15 +2321,56 @@ a {
  * Responsive
  * ======================================================= */
 
+@media (max-width: 1100px) {
+
+    .stats-grid {
+        grid-template-columns:
+            repeat(
+                2,
+                minmax(
+                    0,
+                    1fr
+                )
+            );
+    }
+
+    .runtime-grid {
+        grid-template-columns:
+            repeat(
+                2,
+                minmax(
+                    0,
+                    1fr
+                )
+            );
+    }
+
+    .connection-card {
+        grid-template-columns: 1fr;
+    }
+
+    .connection-status {
+
+        padding-right: 0;
+
+        padding-bottom: 18px;
+
+        border-right: 0;
+
+        border-bottom:
+            1px solid #edf0f4;
+    }
+}
+
+
 @media (max-width: 800px) {
 
     .sidebar {
 
-        width: 68px;
+        width: 70px;
 
         padding:
-            15px
-            8px;
+            15px 8px;
     }
 
     .logo {
@@ -1164,6 +2378,20 @@ a {
         font-size: 0;
 
         text-align: center;
+
+        padding:
+            10px
+            4px
+            20px;
+    }
+
+    .logo::before {
+
+        content: "OPS";
+
+        font-size: 17px;
+
+        font-weight: 700;
     }
 
     .logo small,
@@ -1176,25 +2404,96 @@ a {
     .menu-item {
 
         justify-content: center;
+
+        padding:
+            12px 8px;
     }
 
     .main {
 
-        margin-left: 68px;
+        margin-left: 70px;
 
         width:
-            calc(100% - 68px);
+            calc(
+                100% - 70px
+            );
+    }
+
+    .topbar {
+
+        padding:
+            0
+            18px;
     }
 
     .content {
 
         padding: 18px;
     }
+
+    .grid {
+
+        grid-template-columns: 1fr;
+    }
+
+    .config-mini {
+
+        grid-template-columns:
+            repeat(
+                2,
+                minmax(
+                    0,
+                    1fr
+                )
+            );
+    }
+}
+
+
+@media (max-width: 560px) {
+
+    .stats-grid {
+
+        grid-template-columns: 1fr;
+    }
+
+    .runtime-grid {
+
+        grid-template-columns: 1fr;
+    }
+
+    .page-head {
+
+        align-items: flex-start;
+
+        flex-direction: column;
+    }
+
+    .key-search-row {
+
+        flex-wrap: wrap;
+    }
+
+    .key-search {
+
+        flex-basis: 100%;
+    }
+
+    .key-actions {
+
+        width: 100%;
+    }
+
+    .key-actions .btn {
+
+        flex: 1;
+    }
 }
 
 </style>
 
 </head>
+
 
 <body>
 
@@ -1301,887 +2600,2020 @@ a {
 <main class="main">
 
 
-<header class="topbar">
+    <!-- Topbar -->
 
-    <div class="top-title">
-        Redis
-    </div>
+    <div class="topbar">
 
-    <div class="top-right">
-
-        PHP <?php echo h(PHP_VERSION); ?>
-
-    </div>
-
-</header>
-
-
-<section class="content">
-
-
-<div class="page-header">
-
-    <div
-        style="
-            display:flex;
-            align-items:center;
-            justify-content:space-between;
-            gap:15px;
-        "
-    >
-
-        <div>
-
-            <h1>
-                Redis
-            </h1>
-
-            <p>
-                Redis 服务状态、性能与缓存信息
-            </p>
-
-        </div>
-
-
-        <button
-            class="refresh"
-            onclick="location.reload();"
-        >
-            ↻ 刷新
-        </button>
-
-    </div>
-
-</div>
-
-
-<?php if (!$redisConnected): ?>
-
-
-<div class="alert">
-
-    <strong>
-        Redis 连接失败
-    </strong>
-
-    <br>
-
-    <?php echo h($redisError); ?>
-
-</div>
-
-
-<div class="card">
-
-    <div class="card-title">
-
-        <h3>
-            Redis Configuration
-        </h3>
-
-        <?php
-
-        echo redisStatus(
-            $redisHost !== '',
-            '已读取',
-            '未读取'
-        );
-
-        ?>
-
-    </div>
-
-
-    <div class="info-row">
-
-        <span class="info-label">
-            Host
-        </span>
-
-        <span class="info-value">
-            <?php echo h($redisHost ?: '-'); ?>
-        </span>
-
-    </div>
-
-
-    <div class="info-row">
-
-        <span class="info-label">
-            Port
-        </span>
-
-        <span class="info-value">
-            <?php echo h($redisPort); ?>
-        </span>
-
-    </div>
-
-
-    <div class="info-row">
-
-        <span class="info-label">
-            Database
-        </span>
-
-        <span class="info-value">
-            <?php echo h($redisDb); ?>
-        </span>
-
-    </div>
-
-
-    <div class="info-row">
-
-        <span class="info-label">
-            PHP Redis Extension
-        </span>
-
-        <span class="info-value">
-
-            <?php
-
-            echo redisStatus(
-                $redisExtensionAvailable,
-                'Available',
-                'Missing'
-            );
-
-            ?>
-
-        </span>
-
-    </div>
-
-</div>
-
-
-<?php else: ?>
-
-
-<div class="success-box">
-
-    <strong>
-        Redis 连接正常
-    </strong>
-
-    <br>
-
-    已成功读取 AppleCMS Redis 配置并连接 Redis 服务。
-
-</div>
-
-
-<!-- =====================================================
-     第一行：核心指标
-====================================================== -->
-
-<div class="grid">
-
-
-    <!-- Redis Status -->
-
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Status
-            </h3>
-
-            <?php
-
-            echo redisStatus(
-                true,
-                '在线',
-                '离线'
-            );
-
-            ?>
-
-        </div>
-
-        <div class="big-value">
-
+        <div class="top-title">
             Redis
-            <?php echo h($redisVersion); ?>
-
         </div>
 
-        <div class="sub-value">
+        <div class="top-right">
 
-            <?php echo h($redisMode); ?>
-
-        </div>
-
-    </div>
-
-
-    <!-- Keys -->
-
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Keys
-            </h3>
-
-        </div>
-
-        <div class="big-value">
-
-            <?php echo number_format($redisTotalKeys); ?>
-
-        </div>
-
-        <div class="sub-value">
-
-            <?php echo h($redisDatabaseCount); ?>
-            个数据库正在使用
+            PHP
+            <?php echo h(PHP_VERSION); ?>
 
         </div>
 
     </div>
 
 
-    <!-- Memory -->
+    <!-- Content -->
 
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Memory
-            </h3>
-
-        </div>
-
-        <div class="big-value">
-
-            <?php echo h(formatBytes($redisUsedMemory)); ?>
-
-        </div>
-
-        <div class="sub-value">
-
-            Peak：
-            <?php echo h(formatBytes($redisPeakMemory)); ?>
-
-        </div>
-
-    </div>
+    <div class="content">
 
 
-    <!-- Hit Rate -->
+        <!-- =================================================
+             Page Header
+        ================================================== -->
 
-    <div class="card">
+        <div class="page-head">
 
-        <div class="card-title">
+            <div class="page-title">
 
-            <h3>
-                Hit Rate
-            </h3>
+                <h1>
+                    Redis
+                </h1>
 
-        </div>
+                <p>
+                    Redis 服务状态、性能与缓存管理
+                </p>
 
-        <div class="big-value">
-
-            <?php
-
-            echo number_format(
-                $redisHitRate,
-                2
-            );
-
-            ?>%
-
-        </div>
-
-        <div class="sub-value">
-
-            Hits：
-            <?php echo number_format($redisHits); ?>
-
-            /
-            Miss：
-            <?php echo number_format($redisMisses); ?>
-
-        </div>
-
-    </div>
-
-</div>
+            </div>
 
 
-<!-- =====================================================
-     第二行
-====================================================== -->
-
-<div class="grid">
-
-
-    <!-- Server -->
-
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Server
-            </h3>
+            <button
+                class="refresh"
+                onclick="location.reload();"
+            >
+                ↻ 刷新
+            </button>
 
         </div>
 
 
-        <div class="info-row">
+        <!-- =================================================
+             Connection + Configuration
+        ================================================== -->
 
-            <span class="info-label">
-                Version
-            </span>
+        <?php if (!$redisConnected): ?>
 
-            <span class="info-value">
+            <div class="alert danger">
 
-                <?php echo h($redisVersion); ?>
+                <strong>
+                    Redis 连接失败
+                </strong>
 
-            </span>
+                <div style="margin-top:5px;">
 
-        </div>
+                    <?php echo h($redisError); ?>
 
+                </div>
 
-        <div class="info-row">
+            </div>
 
-            <span class="info-label">
-                Mode
-            </span>
+        <?php else: ?>
 
-            <span class="info-value">
+            <div class="card connection-card">
 
-                <?php echo h($redisMode); ?>
 
-            </span>
+                <div class="connection-status">
 
-        </div>
+                    <div
+                        style="
+                            margin-bottom:10px;
+                        "
+                    >
 
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Uptime
-            </span>
-
-            <span class="info-value">
-
-                <?php echo h(
-                    formatSeconds(
-                        $redisUptime
-                    )
-                ); ?>
-
-            </span>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Commands
-            </span>
-
-            <span class="info-value">
-
-                <?php echo number_format(
-                    $redisCommandsProcessed
-                ); ?>
-
-            </span>
-
-        </div>
-
-    </div>
-
-
-    <!-- Clients -->
-
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Clients
-            </h3>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Connected
-            </span>
-
-            <span class="info-value">
-
-                <?php echo number_format(
-                    $redisConnectedClients
-                ); ?>
-
-            </span>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Blocked
-            </span>
-
-            <span class="info-value">
-
-                <?php echo number_format(
-                    $redisBlockedClients
-                ); ?>
-
-            </span>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Operations / sec
-            </span>
-
-            <span class="info-value">
-
-                <?php echo number_format(
-                    $redisOpsPerSecond
-                ); ?>
-
-            </span>
-
-        </div>
-
-    </div>
-
-
-    <!-- Memory -->
-
-    <div class="card">
-
-        <div class="card-title">
-
-            <h3>
-                Memory
-            </h3>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Used
-            </span>
-
-            <span class="info-value">
-
-                <?php echo h(
-                    formatBytes(
-                        $redisUsedMemory
-                    )
-                ); ?>
-
-            </span>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Peak
-            </span>
-
-            <span class="info-value">
-
-                <?php echo h(
-                    formatBytes(
-                        $redisPeakMemory
-                    )
-                ); ?>
-
-            </span>
-
-        </div>
-
-
-        <div class="info-row">
-
-            <span class="info-label">
-                Max Memory
-            </span>
-
-            <span class="info-value">
-
-                <?php
-
-                if ($redisMaxMemory > 0) {
-
-                    echo h(
-                        formatBytes(
-                            $redisMaxMemory
-                        )
-                    );
-
-                } else {
-
-                    echo 'Unlimited';
-
-                }
-
-                ?>
-
-            </span>
-
-        </div>
-
-
-        <?php if ($redisMaxMemory > 0): ?>
-
-            <div class="progress">
-
-                <div
-                    class="progress-bar"
-                    style="
-                        width:
                         <?php
 
-                        echo min(
-                            100,
-                            max(
-                                0,
-                                ($redisUsedMemory / $redisMaxMemory) * 100
-                            )
+                        echo statusBadge(
+                            true,
+                            '成功连接',
+                            '连接失败'
                         );
 
-                        ?>%;
-                    "
-                ></div>
+                        ?>
+
+                    </div>
+
+
+                    <h2>
+                        Redis 连接正常
+                    </h2>
+
+
+                    <p>
+
+                        已成功读取 AppleCMS Redis 配置
+                        并连接 Redis 服务。
+
+                    </p>
+
+                </div>
+
+
+                <div>
+
+                    <div class="card-title">
+
+                        <h3>
+                            Configuration
+                        </h3>
+
+                        <?php
+
+                        echo statusBadge(
+                            $redisConfigRead,
+                            '成功读取',
+                            '读取失败'
+                        );
+
+                        ?>
+
+                    </div>
+
+
+                    <div class="config-mini">
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                Host
+                            </span>
+
+                            <span class="mini-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisHost ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                Port
+                            </span>
+
+                            <span class="mini-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisPort
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                Database
+                            </span>
+
+                            <span class="mini-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisDb
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                Username
+                            </span>
+
+                            <span class="mini-value">
+
+                                <?php
+
+                                echo $redisUsername !== ''
+                                    ? h($redisUsername)
+                                    : '-';
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                Password
+                            </span>
+
+                            <span class="mini-value">
+
+                                <?php
+
+                                echo $redisPassword !== ''
+                                    ? h(
+                                        maskSecret(
+                                            $redisPassword
+                                        )
+                                    )
+                                    : '未设置';
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="mini-item">
+
+                            <span class="mini-label">
+                                PHP Redis
+                            </span>
+
+                            <span class="mini-value">
+                                Available
+                            </span>
+
+                        </div>
+
+
+                    </div>
+
+                </div>
 
             </div>
 
         <?php endif; ?>
 
-    </div>
+
+        <?php if ($redisConnected): ?>
 
 
-    <!-- Connection -->
+            <!-- =================================================
+                 Key Manager - Top
+            ================================================== -->
 
-    <div class="card">
+            <div class="card key-manager">
 
-        <div class="card-title">
+                <div class="card-title">
 
-            <h3>
-                Connection
-            </h3>
+                    <h3>
+                        Redis Key 管理
+                    </h3>
 
-        </div>
+                    <span
+                        class="status success"
+                    >
 
+                        <span class="dot"></span>
 
-        <div class="info-row">
+                        DB
+                        <?php echo h($redisDb); ?>
 
-            <span class="info-label">
-                Host
-            </span>
+                    </span>
 
-            <span class="info-value">
-
-                <?php echo h(
-                    $redisHost
-                ); ?>
-
-            </span>
-
-        </div>
+                </div>
 
 
-        <div class="info-row">
+                <form
+                    method="get"
+                    action=""
+                >
 
-            <span class="info-label">
-                Port
-            </span>
-
-            <span class="info-value">
-
-                <?php echo h(
-                    $redisPort
-                ); ?>
-
-            </span>
-
-        </div>
+                    <div class="key-search-row">
 
 
-        <div class="info-row">
-
-            <span class="info-label">
-                Database
-            </span>
-
-            <span class="info-value">
-
-                <?php echo h(
-                    $redisDb
-                ); ?>
-
-            </span>
-
-        </div>
+                        <input
+                            type="text"
+                            name="key"
+                            class="key-search"
+                            value="<?php
+                                echo h(
+                                    $redisKeySearch
+                                );
+                            ?>"
+                            placeholder="搜索 Key，例如：vod*、cache_*、maccms*"
+                            autocomplete="off"
+                        >
 
 
-        <div class="info-row">
+                        <button
+                            type="submit"
+                            class="btn btn-primary"
+                        >
+                            搜索
+                        </button>
 
-            <span class="info-label">
-                Password
-            </span>
 
-            <span class="info-value">
+                        <?php if ($redisKeySearch !== ''): ?>
 
-                <?php
+                            <a
+                                href="redis.php"
+                                class="btn btn-light"
+                                style="
+                                    display:flex;
+                                    align-items:center;
+                                    justify-content:center;
+                                "
+                            >
+                                清空
+                            </a>
 
-                echo $redisPassword !== ''
-                    ? h(
-                        maskRedisSecret(
-                            $redisPassword
+                        <?php endif; ?>
+
+
+                    </div>
+
+                </form>
+
+
+                <div class="key-hint">
+
+                    默认搜索范围：
+
+                    <strong>
+                        <?php
+
+                        echo h(
+                            $redisFlag !== ''
+                                ? $redisFlag . '*'
+                                : '*'
+                        );
+
+                        ?>
+
+                    </strong>
+
+                    &nbsp;·&nbsp;
+
+                    当前 DB：
+
+                    <strong>
+                        <?php echo h($redisDb); ?>
+                    </strong>
+
+                    &nbsp;·&nbsp;
+
+                    当前 Key：
+
+                    <strong>
+                        <?php
+
+                        echo number_format(
+                            $redisTotalKeys
+                        );
+
+                        ?>
+
+                    </strong>
+
+                </div>
+
+
+                <?php if ($redisKeySearch !== ''): ?>
+
+                    <div
+                        style="
+                            margin-top:16px;
+                            display:flex;
+                            justify-content:space-between;
+                            align-items:center;
+                            gap:15px;
+                            flex-wrap:wrap;
+                        "
+                    >
+
+                        <div
+                            style="
+                                color:#64748b;
+                                font-size:12px;
+                            "
+                        >
+
+                            搜索：
+
+                            <strong>
+                                <?php
+
+                                echo h(
+                                    $redisKeyPattern
+                                );
+
+                                ?>
+                            </strong>
+
+                            &nbsp;·&nbsp;
+
+                            找到：
+
+                            <strong>
+                                <?php
+
+                                echo number_format(
+                                    count($redisKeyList)
+                                );
+
+                                ?>
+                            </strong>
+
+                            个
+
+                            <?php if (count($redisKeyList) >= 500): ?>
+
+                                <span
+                                    style="
+                                        color:#d97706;
+                                    "
+                                >
+                                    （最多显示 500 个）
+                                </span>
+
+                            <?php endif; ?>
+
+                        </div>
+
+
+                        <?php if (!empty($redisKeyList)): ?>
+
+                            <form
+                                method="post"
+                                action=""
+                                onsubmit="
+                                    return confirm(
+                                        '确定删除当前搜索结果中的所有 Key 吗？'
+                                    );
+                                "
+                            >
+
+                                <input
+                                    type="hidden"
+                                    name="action"
+                                    value="delete_search"
+                                >
+
+                                <input
+                                    type="hidden"
+                                    name="pattern"
+                                    value="<?php
+                                        echo h(
+                                            $redisKeyPattern
+                                        );
+                                    ?>"
+                                >
+
+                                <button
+                                    type="submit"
+                                    class="btn btn-danger"
+                                >
+                                    删除当前搜索结果
+                                </button>
+
+                            </form>
+
+                        <?php endif; ?>
+
+                    </div>
+
+                <?php endif; ?>
+
+            </div>
+
+
+            <!-- Action Message -->
+
+            <?php if ($redisActionMessage !== ''): ?>
+
+                <div
+                    class="alert <?php
+                        echo in_array(
+                            $redisActionType,
+                            [
+                                'success',
+                                'danger',
+                                'warning'
+                            ],
+                            true
                         )
-                    )
-                    : '未设置';
-
-                ?>
-
-            </span>
-
-        </div>
-
-    </div>
-
-</div>
-
-
-<!-- =====================================================
-     AppleCMS Redis 配置
-====================================================== -->
-
-<div class="card">
-
-    <div class="card-title">
-
-        <h3>
-            AppleCMS Redis Configuration
-        </h3>
-
-        <?php
-
-        echo redisStatus(
-            $redisHost !== '',
-            '成功读取',
-            '读取失败'
-        );
-
-        ?>
-
-    </div>
-
-
-    <div class="grid"
-         style="margin-bottom:0;">
-
-
-        <div>
-
-            <div class="info-row">
-
-                <span class="info-label">
-                    cache_host
-                </span>
-
-                <span class="info-value">
-
-                    <?php echo h(
-                        $redisHost ?: '-'
-                    ); ?>
-
-                </span>
-
-            </div>
-
-
-            <div class="info-row">
-
-                <span class="info-label">
-                    cache_port
-                </span>
-
-                <span class="info-value">
-
-                    <?php echo h(
-                        $redisPort
-                    ); ?>
-
-                </span>
-
-            </div>
-
-
-            <div class="info-row">
-
-                <span class="info-label">
-                    cache_username
-                </span>
-
-                <span class="info-value">
+                            ? h($redisActionType)
+                            : 'success';
+                    ?>"
+                >
 
                     <?php
 
-                    echo $redisUsername !== ''
-                        ? h($redisUsername)
-                        : '空';
+                    echo h(
+                        $redisActionMessage
+                    );
 
                     ?>
 
-                </span>
+                </div>
 
-            </div>
+            <?php endif; ?>
 
 
-            <div class="info-row">
+            <!-- =================================================
+                 Key List
+            ================================================== -->
 
-                <span class="info-label">
-                    cache_password
-                </span>
+            <?php if ($redisKeySearch !== ''): ?>
 
-                <span class="info-value">
+                <div class="card">
 
-                    <?php
+                    <div class="card-title">
 
-                    echo $redisPassword !== ''
-                        ? h(
-                            maskRedisSecret(
-                                $redisPassword
+                        <h3>
+                            Key 列表
+                        </h3>
+
+                    </div>
+
+
+                    <div class="key-table-wrap">
+
+                        <table class="key-table">
+
+                            <thead>
+
+                                <tr>
+
+                                    <th style="width:55%;">
+                                        Key
+                                    </th>
+
+                                    <th>
+                                        Type
+                                    </th>
+
+                                    <th>
+                                        TTL
+                                    </th>
+
+                                    <th style="width:150px;">
+                                        操作
+                                    </th>
+
+                                </tr>
+
+                            </thead>
+
+
+                            <tbody>
+
+
+                            <?php if (empty($redisKeyList)): ?>
+
+                                <tr>
+
+                                    <td
+                                        colspan="4"
+                                        class="empty"
+                                    >
+                                        没有找到匹配的 Key
+                                    </td>
+
+                                </tr>
+
+                            <?php else: ?>
+
+
+                                <?php foreach (
+                                    $redisKeyList
+                                    as $key
+                                ): ?>
+
+
+                                    <?php
+
+                                    $keyType = '-';
+
+                                    $keyTtl = '-';
+
+                                    try {
+
+                                        $typeValue =
+                                            $redis->type(
+                                                $key
+                                            );
+
+                                        switch ($typeValue) {
+
+                                            case Redis::REDIS_STRING:
+                                                $keyType = 'string';
+                                                break;
+
+                                            case Redis::REDIS_LIST:
+                                                $keyType = 'list';
+                                                break;
+
+                                            case Redis::REDIS_SET:
+                                                $keyType = 'set';
+                                                break;
+
+                                            case Redis::REDIS_ZSET:
+                                                $keyType = 'zset';
+                                                break;
+
+                                            case Redis::REDIS_HASH:
+                                                $keyType = 'hash';
+                                                break;
+
+                                            case Redis::REDIS_STREAM:
+                                                $keyType = 'stream';
+                                                break;
+
+                                            default:
+                                                $keyType = 'unknown';
+                                        }
+
+
+                                        $ttl =
+                                            $redis->ttl(
+                                                $key
+                                            );
+
+
+                                        if ($ttl === -1) {
+
+                                            $keyTtl =
+                                                '永久';
+
+                                        } elseif ($ttl === -2) {
+
+                                            $keyTtl =
+                                                '不存在';
+
+                                        } else {
+
+                                            $keyTtl =
+                                                formatSeconds(
+                                                    $ttl
+                                                );
+                                        }
+
+                                    } catch (Throwable $e) {
+
+                                        $keyType = '-';
+
+                                        $keyTtl = '-';
+                                    }
+
+                                    ?>
+
+
+                                    <tr>
+
+
+                                        <td>
+
+                                            <div
+                                                class="key-name"
+                                            >
+                                                <?php
+
+                                                echo h(
+                                                    $key
+                                                );
+
+                                                ?>
+                                            </div>
+
+                                        </td>
+
+
+                                        <td>
+
+                                            <span
+                                                class="key-type"
+                                            >
+                                                <?php
+
+                                                echo h(
+                                                    $keyType
+                                                );
+
+                                                ?>
+                                            </span>
+
+                                        </td>
+
+
+                                        <td>
+
+                                            <span
+                                                class="key-ttl"
+                                            >
+                                                <?php
+
+                                                echo h(
+                                                    $keyTtl
+                                                );
+
+                                                ?>
+                                            </span>
+
+                                        </td>
+
+
+                                        <td>
+
+                                            <div
+                                                class="key-actions"
+                                            >
+
+
+                                                <a
+                                                    href="?<?php
+                                                        echo http_build_query(
+                                                            [
+                                                                'key' =>
+                                                                    $redisKeySearch,
+                                                                'view' =>
+                                                                    $key
+                                                            ]
+                                                        );
+                                                    ?>"
+                                                    class="btn btn-light"
+                                                    style="
+                                                        height:34px;
+                                                        padding:0 10px;
+                                                        display:flex;
+                                                        align-items:center;
+                                                        justify-content:center;
+                                                    "
+                                                >
+                                                    查看
+                                                </a>
+
+
+                                                <form
+                                                    method="post"
+                                                    action=""
+                                                    onsubmit="
+                                                        return confirm(
+                                                            '确定删除这个 Key 吗？'
+                                                        );
+                                                    "
+                                                    style="margin:0;"
+                                                >
+
+                                                    <input
+                                                        type="hidden"
+                                                        name="action"
+                                                        value="delete_key"
+                                                    >
+
+                                                    <input
+                                                        type="hidden"
+                                                        name="key"
+                                                        value="<?php
+                                                            echo h(
+                                                                $key
+                                                            );
+                                                        ?>"
+                                                    >
+
+                                                    <button
+                                                        type="submit"
+                                                        class="btn btn-danger"
+                                                        style="
+                                                            height:34px;
+                                                            padding:0 10px;
+                                                        "
+                                                    >
+                                                        删除
+                                                    </button>
+
+                                                </form>
+
+
+                                            </div>
+
+                                        </td>
+
+
+                                    </tr>
+
+
+                                <?php endforeach; ?>
+
+
+                            <?php endif; ?>
+
+
+                            </tbody>
+
+                        </table>
+
+                    </div>
+
+                </div>
+
+            <?php endif; ?>
+
+
+            <!-- =================================================
+                 Selected Key
+            ================================================== -->
+
+            <?php if ($redisSelectedKey !== ''): ?>
+
+                <div class="card">
+
+                    <div class="card-title">
+
+                        <h3>
+                            Key 内容
+                        </h3>
+
+                        <a
+                            href="?<?php
+                                echo http_build_query(
+                                    [
+                                        'key' =>
+                                            $redisKeySearch
+                                    ]
+                                );
+                            ?>"
+                            class="btn btn-light"
+                            style="
+                                height:34px;
+                                display:flex;
+                                align-items:center;
+                            "
+                        >
+                            返回列表
+                        </a>
+
+                    </div>
+
+
+                    <div
+                        class="info-row"
+                        style="
+                            border-bottom:0;
+                        "
+                    >
+
+                        <span class="info-label">
+                            Key
+                        </span>
+
+                        <span class="info-value">
+                            <?php
+
+                            echo h(
+                                $redisSelectedKey
+                            );
+
+                            ?>
+                        </span>
+
+                    </div>
+
+
+                    <div class="key-value">
+
+<?php
+
+if (
+    is_array(
+        $redisSelectedValue
+    )
+) {
+
+    echo h(
+        json_encode(
+            $redisSelectedValue,
+            JSON_PRETTY_PRINT
+            | JSON_UNESCAPED_UNICODE
+            | JSON_UNESCAPED_SLASHES
+        )
+    );
+
+} elseif (
+    $redisSelectedValue === null
+) {
+
+    echo 'NULL';
+
+} else {
+
+    echo h(
+        (string)$redisSelectedValue
+    );
+}
+
+?>
+
+                    </div>
+
+                </div>
+
+            <?php endif; ?>
+
+
+            <!-- =================================================
+                 Stats
+            ================================================== -->
+
+            <div class="stats-grid">
+
+
+                <div class="stat-card">
+
+                    <div class="stat-title">
+                        Status
+                    </div>
+
+                    <div class="big-value">
+
+                        <?php
+
+                        echo h(
+                            $redisStatusText
+                        );
+
+                        ?>
+
+                    </div>
+
+                    <div class="sub-value">
+
+                        Redis
+                        <?php
+
+                        echo h(
+                            $redisVersion
+                        );
+
+                        ?>
+
+                        ·
+
+                        <?php
+
+                        echo h(
+                            $redisMode
+                        );
+
+                        ?>
+
+                    </div>
+
+                </div>
+
+
+                <div class="stat-card">
+
+                    <div class="stat-title">
+                        Keys
+                    </div>
+
+                    <div class="big-value">
+
+                        <?php
+
+                        echo number_format(
+                            $redisTotalKeys
+                        );
+
+                        ?>
+
+                    </div>
+
+                    <div class="sub-value">
+
+                        当前 DB
+                        <?php
+
+                        echo h(
+                            $redisDb
+                        );
+
+                        ?>
+
+                        ·
+
+                        <?php
+
+                        echo $redisDatabaseCount > 0
+                            ? number_format(
+                                $redisDatabaseCount
+                            ) . ' 个数据库'
+                            : '数据库数量未知';
+
+                        ?>
+
+                    </div>
+
+                </div>
+
+
+                <div class="stat-card">
+
+                    <div class="stat-title">
+                        Memory
+                    </div>
+
+                    <div class="big-value">
+
+                        <?php
+
+                        echo h(
+                            formatBytes(
+                                $redisUsedMemory
                             )
-                        )
-                        : '空';
+                        );
+
+                        ?>
+
+                    </div>
+
+                    <div class="sub-value">
+
+                        Peak：
+
+                        <?php
+
+                        echo h(
+                            formatBytes(
+                                $redisPeakMemory
+                            )
+                        );
+
+                        ?>
+
+                    </div>
+
+                </div>
+
+
+                <div class="stat-card">
+
+                    <div class="stat-title">
+                        Hit Rate
+                    </div>
+
+                    <div class="big-value">
+
+                        <?php
+
+                        echo number_format(
+                            $redisHitRate,
+                            2
+                        );
+
+                        ?>%
+
+                    </div>
+
+                    <div class="sub-value">
+
+                        Hits：
+                        <?php
+
+                        echo number_format(
+                            $redisHits
+                        );
+
+                        ?>
+
+                        /
+
+                        Miss：
+                        <?php
+
+                        echo number_format(
+                            $redisMisses
+                        );
+
+                        ?>
+
+                    </div>
+
+                </div>
+
+
+            </div>
+
+
+            <!-- =================================================
+                 Server / Clients
+            ================================================== -->
+
+            <div class="grid">
+
+
+                <!-- Server -->
+
+                <div class="card">
+
+                    <div class="card-title">
+
+                        <h3>
+                            Server
+                        </h3>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Version
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                $redisVersion
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Mode
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                $redisMode
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Uptime
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                formatSeconds(
+                                    $redisUptime
+                                )
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Commands
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo number_format(
+                                $redisCommandsProcessed
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                </div>
+
+
+                <!-- Clients -->
+
+                <div class="card">
+
+                    <div class="card-title">
+
+                        <h3>
+                            Clients
+                        </h3>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Connected
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo number_format(
+                                $redisConnectedClients
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Blocked
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo number_format(
+                                $redisBlockedClients
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Operations / sec
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo number_format(
+                                $redisOpsPerSecond
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                </div>
+
+
+            </div>
+
+
+            <!-- =================================================
+                 Memory / Connection
+            ================================================== -->
+
+            <div class="grid">
+
+
+                <!-- Memory -->
+
+                <div class="card">
+
+                    <div class="card-title">
+
+                        <h3>
+                            Memory
+                        </h3>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Used
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                formatBytes(
+                                    $redisUsedMemory
+                                )
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Peak
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                formatBytes(
+                                    $redisPeakMemory
+                                )
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Max Memory
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            if (
+                                $redisMaxMemory > 0
+                            ) {
+
+                                echo h(
+                                    formatBytes(
+                                        $redisMaxMemory
+                                    )
+                                );
+
+                            } else {
+
+                                echo 'Unlimited';
+                            }
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <?php if (
+                        $redisMaxMemory > 0
+                    ): ?>
+
+
+                        <div class="progress">
+
+                            <div
+                                class="progress-bar"
+                                style="
+                                    width:
+                                    <?php
+
+                                    echo min(
+                                        100,
+                                        max(
+                                            0,
+                                            (
+                                                $redisUsedMemory
+                                                /
+                                                $redisMaxMemory
+                                            ) * 100
+                                        )
+                                    );
+
+                                    ?>%;
+                                "
+                            ></div>
+
+                        </div>
+
+
+                    <?php endif; ?>
+
+
+                </div>
+
+
+                <!-- Connection -->
+
+                <div class="card">
+
+                    <div class="card-title">
+
+                        <h3>
+                            Connection
+                        </h3>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Host
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                $redisHost
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Port
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo h(
+                                $redisPort
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Database
+                        </span>
+
+                        <span class="info-value">
+
+                            DB
+                            <?php
+
+                            echo h(
+                                $redisDb
+                            );
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Password
+                        </span>
+
+                        <span class="info-value">
+
+                            <?php
+
+                            echo $redisPassword !== ''
+                                ? h(
+                                    maskSecret(
+                                        $redisPassword
+                                    )
+                                )
+                                : '未设置';
+
+                            ?>
+
+                        </span>
+
+                    </div>
+
+
+                </div>
+
+
+            </div>
+
+
+            <!-- =================================================
+                 AppleCMS Redis Configuration
+            ================================================== -->
+
+            <div class="card">
+
+                <div class="card-title">
+
+                    <h3>
+                        AppleCMS Redis Configuration
+                    </h3>
+
+                    <?php
+
+                    echo statusBadge(
+                        $redisConfigRead,
+                        '成功读取',
+                        '读取失败'
+                    );
 
                     ?>
 
-                </span>
+                </div>
+
+
+                <div class="grid">
+
+
+                    <div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_host
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisHost ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_port
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisPort
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_username
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo $redisUsername !== ''
+                                    ? h(
+                                        $redisUsername
+                                    )
+                                    : '空';
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_password
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo $redisPassword !== ''
+                                    ? h(
+                                        maskSecret(
+                                            $redisPassword
+                                        )
+                                    )
+                                    : '空';
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_db
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisDb
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                    </div>
+
+
+                    <div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_flag
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisFlag ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_core
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisCore ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_time
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisCacheTime ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_page
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisCachePage ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                        <div class="info-row">
+
+                            <span class="info-label">
+                                cache_time_page
+                            </span>
+
+                            <span class="info-value">
+
+                                <?php
+
+                                echo h(
+                                    $redisCacheTimePage ?: '-'
+                                );
+
+                                ?>
+
+                            </span>
+
+                        </div>
+
+
+                    </div>
+
+
+                </div>
 
             </div>
 
-        </div>
+
+            <!-- =================================================
+                 Runtime
+            ================================================== -->
+
+            <div class="card">
+
+                <div class="card-title">
+
+                    <h3>
+                        Runtime
+                    </h3>
+
+                </div>
 
 
-        <div>
+                <div class="runtime-grid">
 
-            <div class="info-row">
 
-                <span class="info-label">
-                    cache_db
-                </span>
+                    <div>
 
-                <span class="info-value">
+                        <div class="mini-label">
+                            PHP Version
+                        </div>
 
-                    <?php echo h(
-                        $redisDb
-                    ); ?>
+                        <div class="mini-value">
 
-                </span>
+                            <?php
+
+                            echo h(
+                                PHP_VERSION
+                            );
+
+                            ?>
+
+                        </div>
+
+                    </div>
+
+
+                    <div>
+
+                        <div class="mini-label">
+                            PHP Redis Extension
+                        </div>
+
+                        <div class="mini-value">
+
+                            <?php
+
+                            echo $redisExtensionAvailable
+                                ? 'Available'
+                                : 'Missing';
+
+                            ?>
+
+                        </div>
+
+                    </div>
+
+
+                    <div>
+
+                        <div class="mini-label">
+                            AppleCMS Config
+                        </div>
+
+                        <div class="mini-value">
+
+                            <?php
+
+                            echo $redisConfigRead
+                                ? '成功读取'
+                                : '读取失败';
+
+                            ?>
+
+                        </div>
+
+                    </div>
+
+
+                    <div>
+
+                        <div class="mini-label">
+                            Application Root
+                        </div>
+
+                        <div
+                            class="mini-value"
+                            style="
+                                word-break:break-all;
+                            "
+                        >
+
+                            <?php
+
+                            echo h(
+                                $APP_ROOT
+                            );
+
+                            ?>
+
+                        </div>
+
+                    </div>
+
+
+                </div>
 
             </div>
 
 
-            <div class="info-row">
+            <!-- =================================================
+                 Last Check
+            ================================================== -->
 
-                <span class="info-label">
-                    cache_flag
-                </span>
+            <div class="card">
 
-                <span class="info-value">
+                <div class="card-title">
 
-                    <?php echo h(
-                        $redisFlag ?: '-'
-                    ); ?>
+                    <h3>
+                        Last Check
+                    </h3>
 
-                </span>
+                </div>
+
+
+                <div class="info-row">
+
+                    <span class="info-label">
+                        Current Time
+                    </span>
+
+                    <span class="info-value">
+
+                        <?php
+
+                        echo h(
+                            $currentTime
+                        );
+
+                        ?>
+
+                    </span>
+
+                </div>
+
+
+                <div class="info-row">
+
+                    <span class="info-label">
+                        Connection
+                    </span>
+
+                    <span class="info-value">
+
+                        <?php
+
+                        echo h(
+                            $redisConnectionText
+                        );
+
+                        ?>
+
+                    </span>
+
+                </div>
+
+
+                <div class="info-row">
+
+                    <span class="info-label">
+                        Database
+                    </span>
+
+                    <span class="info-value">
+
+                        DB
+                        <?php
+
+                        echo h(
+                            $redisDb
+                        );
+
+                        ?>
+
+                    </span>
+
+                </div>
+
 
             </div>
 
 
-            <div class="info-row">
+        <?php endif; ?>
 
-                <span class="info-label">
-                    cache_core
-                </span>
-
-                <span class="info-value">
-
-                    <?php echo h(
-                        $redisCore ?: '-'
-                    ); ?>
-
-                </span>
-
-            </div>
-
-
-            <div class="info-row">
-
-                <span class="info-label">
-                    cache_time
-                </span>
-
-                <span class="info-value">
-
-                    <?php echo h(
-                        $redisCacheTime ?: '-'
-                    ); ?>
-
-                </span>
-
-            </div>
-
-        </div>
 
     </div>
-
-</div>
-
-
-<br>
-
-
-<div
-    style="
-        text-align:right;
-        color:#94a3b8;
-        font-size:12px;
-    "
->
-
-    最后检测：
-    <?php echo h($currentTime); ?>
-
-</div>
-
-
-<?php endif; ?>
-
-
-</section>
 
 </main>
 
@@ -2191,14 +4623,68 @@ a {
 <script>
 
 /*
- * Redis 页面不使用高频 AJAX。
- *
- * 后面增加实时监控时，
- * 再改成局部 AJAX 更新，
- * 避免整个页面刷新。
+ * 删除搜索结果时再次确认
  */
+document.addEventListener(
+    'submit',
+    function(event) {
+
+        var form = event.target;
+
+        if (
+            form.tagName === 'FORM'
+            &&
+            form.querySelector(
+                'input[name="action"][value="delete_search"]'
+            )
+        ) {
+
+            if (
+                !confirm(
+                    '确定删除当前搜索结果中的所有 Key 吗？'
+                )
+            ) {
+
+                event.preventDefault();
+            }
+        }
+
+    }
+);
+
+
+/*
+ * 删除单个 Key 时确认
+ */
+document.addEventListener(
+    'submit',
+    function(event) {
+
+        var form = event.target;
+
+        if (
+            form.tagName === 'FORM'
+            &&
+            form.querySelector(
+                'input[name="action"][value="delete_key"]'
+            )
+        ) {
+
+            if (
+                !confirm(
+                    '确定删除这个 Key 吗？'
+                )
+            ) {
+
+                event.preventDefault();
+            }
+        }
+
+    }
+);
 
 </script>
+
 
 </body>
 
