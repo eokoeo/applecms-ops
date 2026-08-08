@@ -5,23 +5,18 @@
  *
  * PHP 7.4+
  *
- * 自动读取：
- *   ../application/extra/maccms.php
- *   ../application/database.php
+ 
  */
 
 declare(strict_types=1);
 
 session_start();
-
-/* =========================================================
- * 基础路径与配置加载
- * ======================================================= */
-
+require_once 'login.php';
+/*
 $APP_ROOT = realpath(__DIR__ . '/..') ?: dirname(__DIR__);
 $MACCMS_CONFIG = $APP_ROOT . '/application/extra/maccms.php';
 $DATABASE_CONFIG = $APP_ROOT . '/application/database.php';
-
+*/
 function h($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 }
