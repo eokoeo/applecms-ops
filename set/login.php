@@ -15,11 +15,10 @@ if ($APP_ROOT === false) {
 $DATABASE_CONFIG = $APP_ROOT . '/application/database.php';
 $MACCMS_CONFIG = $APP_ROOT . '/application/extra/maccms.php';
 
-// 2. 自动初始化数据库连接（如果全局还没有 $pdo）
+// 2. 自动初始化数据库连接
 if (!isset($pdo)) {
     if (file_exists($DATABASE_CONFIG)) {
         $db_config = include $DATABASE_CONFIG;
-        // 兼容处理不同版本苹果CMS的配置数组格式
         $db = $db_config['connections']['mysql'] ?? $db_config;
         $dsn = "mysql:host=" . ($db['hostname'] ?? '127.0.0.1') . ";port=" . ($db['hostport'] ?? 3306) . ";dbname=" . ($db['database'] ?? '') . ";charset=utf8mb4";
         
@@ -36,9 +35,28 @@ if (!isset($pdo)) {
     }
 }
 
+// ==========================================
+// 3. 【核心新增】针对 API 触发、命令行或特殊参数的放行机制
+// ==========================================
+$is_api_or_cron = false;
+
+// 方式 A：如果 URL 中带有 ?add 或其他特定的自动化参数，允许放行
+// （你可以根据需要增减参数，比如 isset($_GET['add']) 或 isset($_GET['token'])）
+if (isset($_GET['add']) || isset($_GET['api_action']) || php_sapi_name() === 'cli') {
+    $is_api_or_cron = true;
+}
+
+// 方式 B：如果你希望更安全，可以加一个密码 Token 校验（例如 ?add=你的通信密钥）
+// if (isset($_GET['add']) && $_GET['add'] === '你的安全密钥') { $is_api_or_cron = true; }
+
+if ($is_api_or_cron) {
+    return; // 直接放行，不拦截，不显示登录框
+}
+// ==========================================
+
 $login_error = '';
 
-// 3. 处理登录表单提交
+// 4. 处理登录表单提交
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_action'])) {
     $username = trim($_POST['username'] ?? '');
     $password = trim($_POST['password'] ?? '');
@@ -50,10 +68,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_action'])) {
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($user) {
-                // 苹果CMS标准的双重MD5加盐校验
                 $salted_password = md5(md5($password) . $user['admin_random']);
-                
-                if ($user['admin_pwd'] === $salted_password || $user['admin_pwd'] === md5($password) || $user['admin_pwd'] === $password) {
+                if ($user['admin_pwd'] === $salted_password ||$user['admin_pwd'] === md5($password) || $user['admin_pwd'] === $password) {
                     $_SESSION['admin_logged'] = true;
                     $_SESSION['admin_name'] = $user['admin_name'];
                     
@@ -73,7 +89,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_action'])) {
     }
 }
 
-// 4. 已登录则直接放行，返回让主页面继续向下执行
+// 5. 已登录则直接放行
 if (isset($_SESSION['admin_logged']) && $_SESSION['admin_logged'] === true) {
     return; 
 }
@@ -106,7 +122,4 @@ if (isset($_SESSION['admin_logged']) && $_SESSION['admin_logged'] === true) {
     </form>
 </body>
 </html>
-<?php 
-// 5. 未登录拦截，彻底阻断主页面输出
-exit; 
-?>
+<?php exit; ?>
