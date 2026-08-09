@@ -695,15 +695,7 @@ button, input { font-family: inherit; }
 <body>
 
 <div class="app">
-    <aside class="sidebar">
-        <div class="logo">AppleCMS OPS<small>Server Management</small></div>
-        <div class="menu-title">Overview</div>
-        <a class="menu-item <?php echo $page === 'dashboard' ? 'active' : ''; ?>" href="index.php"><span class="menu-icon">⌂</span><span class="menu-text">Dashboard</span></a>
-        <div class="menu-title">Services</div>
-        <a class="menu-item <?php echo $page === 'redis' ? 'active' : ''; ?>" href="redis.php"><span class="menu-icon">R</span><span class="menu-text">Redis</span></a>
-        <a class="menu-item <?php echo $page === 'mysql' ? 'active' : ''; ?>" href="mysql.php"><span class="menu-icon">M</span><span class="menu-text">MySQL</span></a>
-        <a class="menu-item <?php echo $page === 'meilisearch' ? 'active' : ''; ?>" href="meilisearch.php"><span class="menu-icon">S</span><span class="menu-text">Meilisearch</span></a>
-    </aside>
+<?php include 'sidebar.php'; ?>
 
 <main class="main">
     <div class="topbar">
