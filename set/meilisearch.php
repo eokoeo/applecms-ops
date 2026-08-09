@@ -1,7 +1,7 @@
 <?php
 /**
  * AppleCMS OPS
- * Meilisearch Management & Diagnostics with Total Count Offset Incremental Sync
+ * Meilisearch Management & Diagnostics with ID Check Tool
  *
  * PHP 7.4+
  */
@@ -183,7 +183,7 @@ $meiliError = '';
 $indexStats = null;
 $actionMessage = '';
 $actionError = '';
-$searchResult = null;
+$checkResult = null;
 
 if (!$meiliHostFound) {
     $meiliError = '未读取到 Meilisearch 配置';
@@ -234,21 +234,19 @@ if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             $actionError = $syncResult['message'];
         }
-    } elseif ($action === 'search_test') {
-        $keyword = trim($_POST['keyword'] ?? '');
-        if ($keyword !== '') {
-            $searchRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/search", 'POST', [
-                'q' => $keyword,
-                'limit' => 10
-            ]);
-            if ($searchRes['success']) {
-                $searchResult = $searchRes['data'];
-                $actionMessage = "搜索测试完成，共找到 " . ($searchResult['estimatedTotalHits'] ?? count($searchResult['hits'] ?? [])) . " 条结果。";
+    } elseif ($action === 'id_check') {
+        $checkId = trim($_POST['check_id'] ?? '');
+        if ($checkId !== '') {
+            $checkRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents/{$checkId}");
+            if ($checkRes['success']) {
+                $checkResult = $checkRes['data'];
+                $actionMessage = "检测成功：ID [{$checkId}] 已经被 Meilisearch 收录。";
             } else {
-                $actionError = "搜索失败: " . $searchRes['error'];
+                $checkResult = $checkRes['data'];
+                $actionError = "检测结果：ID [{$checkId}] 尚未被收录 (Document not found)。";
             }
         } else {
-            $actionError = "请输入测试搜索关键词。";
+            $actionError = "请输入需要检测的视频 ID。";
         }
     }
 }
@@ -348,7 +346,7 @@ a { color: inherit; text-decoration: none; }
         <section class="content">
             <div class="page-header">
                 <h1>Meilisearch</h1>
-                <p>AppleCMS 全文搜索引擎状态、索引统计、增量同步与联调测试</p>
+                <p>AppleCMS 全文搜索引擎状态、索引统计、增量同步与收录检测</p>
             </div>
 
             <?php if ($actionError): ?>
@@ -359,6 +357,7 @@ a { color: inherit; text-decoration: none; }
                 <div class="success-box" style="margin-bottom: 18px;"><?php echo h($actionMessage); ?></div>
             <?php endif; ?>
 
+            <!-- 状态与增量同步 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Connection & Sync Management</h3>
@@ -404,23 +403,24 @@ a { color: inherit; text-decoration: none; }
             </div>
 
             <?php if ($meiliConnected && $meiliIndexFound): ?>
+            <!-- 指定 ID 收录状态检测工具 -->
             <div class="card">
                 <div class="card-title">
-                    <h3>Search Diagnostics (搜索引擎联调测试)</h3>
+                    <h3>ID Check Diagnostics (指定 ID 收录状态检测)</h3>
                 </div>
-                <p style="font-size: 13px; color: #64748b; margin-top: 0;">直接向当前配置的 Meilisearch 索引发送关键词，测试分词及数据返回情况是否正常。</p>
+                <p style="font-size: 13px; color: #64748b; margin-top: 0;">输入苹果CMS的视频 ID（vod_id），直接在网页上检测该条数据是否已被 Meilisearch 收录。</p>
                 
                 <form method="POST">
-                    <input type="hidden" name="action" value="search_test">
+                    <input type="hidden" name="action" value="id_check">
                     <div class="form-group">
-                        <input type="text" name="keyword" class="form-control" placeholder="输入测试关键词（例如：电影名、演员）" value="<?php echo h($_POST['keyword'] ?? ''); ?>">
-                        <button type="submit" class="btn">立即检索测试</button>
+                        <input type="text" name="check_id" class="form-control" placeholder="输入要查询的视频 ID（例如：514156）" value="<?php echo h($_POST['check_id'] ?? ''); ?>">
+                        <button type="submit" class="btn">立即检测 ID</button>
                     </div>
                 </form>
 
-                <?php if ($searchResult !== null): ?>
-                    <div style="margin-top: 15px; font-size: 13px; font-weight: 600;">返回结果集预览 (Raw JSON Hits)：</div>
-                    <pre class="code-block"><?php echo h(json_encode($searchResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)); ?></pre>
+                <?php if ($checkResult !== null): ?>
+                    <div style="margin-top: 15px; font-size: 13px; font-weight: 600;">检测详情 (JSON):</div>
+                    <pre class="code-block"><?php echo h(json_encode($checkResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)); ?></pre>
                 <?php endif; ?>
             </div>
             <?php endif; ?>
