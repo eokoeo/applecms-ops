@@ -1,11 +1,9 @@
 <?php
 /**
  * AppleCMS OPS
- * Meilisearch Management & Diagnostics with Incremental Sync
+ * Meilisearch Management & Diagnostics with Total Count Offset Incremental Sync
  *
  * PHP 7.4+
- *
- 
  */
 
 declare(strict_types=1);
@@ -95,7 +93,7 @@ function meiliRequest(string $host, string $apiKey, string $endpoint, string $me
         CURLOPT_CUSTOMREQUEST => $method,
     ];
 
-    if (($method === 'POST' || $method === 'PUT') && !empty($data)) {
+    if (($method === 'POST' || $method === 'PUT' || $method === 'PATCH') && !empty($data)) {
         $options[CURLOPT_POSTFIELDS] = json_encode($data, JSON_UNESCAPED_UNICODE);
     }
 
@@ -119,7 +117,7 @@ function meiliRequest(string $host, string $apiKey, string $endpoint, string $me
 }
 
 /* =========================================================
- * 核心逻辑：执行增量同步函数
+ * 核心逻辑：基于总数偏移量的精准增量同步函数
  * ========================================================= */
 function executeIncrementalSync($databaseConfig, $meiliHost, $meiliApiKey, $meiliIndex) {
     try {
@@ -139,26 +137,34 @@ function executeIncrementalSync($databaseConfig, $meiliHost, $meiliApiKey, $meil
 
         $table = $dbPrefix . 'vod';
 
-        // 1. 获取 Meilisearch 当前索引里的文档总数作为参考基数
+        // 1. 获取 Meilisearch 当前索引里的文档总数
         $statsRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/stats");
-        $remoteCount = $statsRes['success'] ? ($statsRes['data']['numberOfDocuments'] ?? 0) : 0;
+        $remoteCount = $statsRes['success'] ? (int)($statsRes['data']['numberOfDocuments'] ?? 0) : 0;
 
-        // 2. 为了防止漏掉数据，我们不卡死时间。采用“查出 MySQL 中最新的前 2000 条数据”或者 
-        // 按照 ID 排序，直接把 Meilisearch 可能缺失的最新数据推过去（Meilisearch 写入相同 ID 是自动覆盖/更新的，非常安全）
-        // 这里我们拉取 MySQL 中最近更新的 1000 条记录进行增量对齐推送
-        $stmt = $pdo->query("SELECT * FROM {$table} ORDER BY vod_time DESC LIMIT 1000");
+        // 2. 直接从 MySQL 中跳过已有数量，取后面的新数据（单次最多 2000 条）
+        $stmt = $pdo->prepare("SELECT * FROM {$table} ORDER BY vod_id ASC LIMIT 2000 OFFSET :offset");
+        $stmt->bindValue(':offset', $remoteCount, PDO::PARAM_INT);
+        $stmt->execute();
         $documents = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         if (empty($documents)) {
-            return ['status' => false, 'message' => 'MySQL 中未查询到任何视频数据。'];
+            return ['status' => true, 'message' => '当前已经是最新状态，没有检测到需要新增的数据。'];
         }
 
-        // 3. 推送到 Meilisearch
+        // 3. 将苹果CMS的 vod_id 映射为 Meilisearch 必需的 id 字段
+        foreach ($documents as &$doc) {
+            if (isset($doc['vod_id'])) {
+                $doc['id'] = (int)$doc['vod_id'];
+            }
+        }
+        unset($doc);
+
+        // 4. 推送到 Meilisearch
         $pushRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents", 'POST', $documents);
         
         if ($pushRes['success']) {
             $taskUid = $pushRes['data']['taskUid'] ?? '未知';
-            return ['status' => true, 'message' => "增量同步触发成功！已向索引推送最新数据批次（共 " . count($documents) . " 条检测对齐）。Task UID: {$taskUid}"];
+            return ['status' => true, 'message' => "精准增量同步触发成功！检测到 " . count($documents) . " 条新数据并已推送。Task UID: {$taskUid}"];
         } else {
             return ['status' => false, 'message' => '推送至 Meilisearch 失败: ' . $pushRes['error']];
         }
@@ -202,13 +208,11 @@ if (!$meiliHostFound) {
  * 响应 ?add 参数 或 POST 提交动作
  * ======================================================= */
 
-// 支持直接通过网址输入 ?add 触发
 if (isset($_GET['add'])) {
     if (!$meiliConnected) {
         die("同步失败: Meilisearch 服务未连接或配置错误。");
     }
     $syncResult = executeIncrementalSync($databaseConfig, $meiliHost, $meiliApiKey, $meiliIndex);
-    // 如果是通过浏览器直接访问 ?add，友好输出结果
     header('Content-Type: text/html; charset=utf-8');
     echo '<div style="margin:20px;font-family:sans-serif;padding:20px;border-radius:8px;background:' . ($syncResult['status'] ? '#f0fdf4;color:#15803d;border:1px solid #bbf7d0' : '#fff1f2;color:#be123c;border:1px solid #fecdd3') . ';">';
     echo '<h2>' . ($syncResult['status'] ? '✅ 增量同步执行成功' : '❌ 增量同步执行失败') . '</h2>';
@@ -218,7 +222,6 @@ if (isset($_GET['add'])) {
     exit;
 }
 
-// 页面内部 POST 按钮或测试搜索提交
 if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     
@@ -226,7 +229,6 @@ if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $syncResult = executeIncrementalSync($databaseConfig, $meiliHost, $meiliApiKey, $meiliIndex);
         if ($syncResult['status']) {
             $actionMessage = $syncResult['message'];
-            // 刷新统计
             $statsCheck = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/stats");
             if ($statsCheck['success']) $indexStats = $statsCheck['data'];
         } else {
@@ -327,7 +329,6 @@ a { color: inherit; text-decoration: none; }
 </head>
 <body>
 <div class="app">
-    <!-- Sidebar -->
     <aside class="sidebar">
         <div class="logo">AppleCMS OPS<small>Server Management</small></div>
         <div class="menu-title">Overview</div>
@@ -338,7 +339,6 @@ a { color: inherit; text-decoration: none; }
         <a class="menu-item active" href="meilisearch.php"><span class="menu-icon">S</span><span class="menu-text">Meilisearch</span></a>
     </aside>
 
-    <!-- Main Content -->
     <main class="main">
         <header class="topbar">
             <div class="top-title">Meilisearch Management</div>
@@ -359,7 +359,6 @@ a { color: inherit; text-decoration: none; }
                 <div class="success-box" style="margin-bottom: 18px;"><?php echo h($actionMessage); ?></div>
             <?php endif; ?>
 
-            <!-- 状态与快捷增量同步卡片 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Connection & Sync Management</h3>
@@ -392,21 +391,19 @@ a { color: inherit; text-decoration: none; }
                 </div>
 
                 <?php if ($meiliConnected): ?>
-                <!-- 增量同步操作栏 -->
                 <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
                     <div style="font-size: 13px; color: #64748b;">
-                        提示：支持通过浏览器直接访问 <code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;color:#2563eb;">?add</code> 触发增量同步。
+                        提示：支持通过浏览器直接访问 <code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;color:#2563eb;">?add</code> 触发精准增量。
                     </div>
                     <form method="POST" style="margin: 0;">
                         <input type="hidden" name="action" value="incremental_sync">
-                        <button type="submit" class="btn btn-success">⚡ 立即执行增量同步</button>
+                        <button type="submit" class="btn btn-success">⚡ 立即执行精准增量同步</button>
                     </form>
                 </div>
                 <?php endif; ?>
             </div>
 
             <?php if ($meiliConnected && $meiliIndexFound): ?>
-            <!-- 联想功能：在线搜索关键词测试 -->
             <div class="card">
                 <div class="card-title">
                     <h3>Search Diagnostics (搜索引擎联调测试)</h3>
