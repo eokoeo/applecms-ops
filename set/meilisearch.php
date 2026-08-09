@@ -1,7 +1,7 @@
 <?php
 /**
  * AppleCMS OPS
- * Meilisearch Management & Diagnostics with ID Check Tool
+ * Meilisearch Management & Diagnostics with Smart Check Tool (ID & Title)
  *
  * PHP 7.4+
  */
@@ -234,19 +234,35 @@ if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             $actionError = $syncResult['message'];
         }
-    } elseif ($action === 'id_check') {
-        $checkId = trim($_POST['check_id'] ?? '');
-        if ($checkId !== '') {
-            $checkRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents/{$checkId}");
-            if ($checkRes['success']) {
-                $checkResult = $checkRes['data'];
-                $actionMessage = "检测成功：ID [{$checkId}] 已经被 Meilisearch 收录。";
+    } elseif ($action === 'smart_check') {
+        $keyword = trim($_POST['check_keyword'] ?? '');
+        if ($keyword !== '') {
+            // 判断输入的是否为纯数字（当作 ID 精确查）
+            if (ctype_digit($keyword)) {
+                $checkRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents/{$keyword}");
+                if ($checkRes['success']) {
+                    $checkResult = $checkRes['data'];
+                    $actionMessage = "检测成功：ID [{$keyword}] 已被收录。";
+                } else {
+                    $checkResult = $checkRes['data'];
+                    $actionError = "检测结果：ID [{$keyword}] 尚未被收录 (Document not found)。";
+                }
             } else {
-                $checkResult = $checkRes['data'];
-                $actionError = "检测结果：ID [{$checkId}] 尚未被收录 (Document not found)。";
+                // 输入的是文字/标题（当作关键词搜索查）
+                $searchRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/search", 'POST', [
+                    'q' => $keyword,
+                    'limit' => 10
+                ]);
+                if ($searchRes['success']) {
+                    $checkResult = $searchRes['data'];
+                    $totalHits = $checkResult['estimatedTotalHits'] ?? count($checkResult['hits'] ?? []);
+                    $actionMessage = "关键词检索完成，共找到包含 [{$keyword}] 的相关视频约 {$totalHits} 条。";
+                } else {
+                    $actionError = "检索失败: " . $searchRes['error'];
+                }
             }
         } else {
-            $actionError = "请输入需要检测的视频 ID。";
+            $actionError = "请输入需要检测的视频 ID 或 标题关键词。";
         }
     }
 }
@@ -327,15 +343,7 @@ a { color: inherit; text-decoration: none; }
 </head>
 <body>
 <div class="app">
-    <aside class="sidebar">
-        <div class="logo">AppleCMS OPS<small>Server Management</small></div>
-        <div class="menu-title">Overview</div>
-        <a class="menu-item" href="index.php?page=dashboard"><span class="menu-icon">⌂</span><span class="menu-text">Dashboard</span></a>
-        <div class="menu-title">Services</div>
-        <a class="menu-item" href="redis.php"><span class="menu-icon">R</span><span class="menu-text">Redis</span></a>
-        <a class="menu-item" href="mysql.php"><span class="menu-icon">M</span><span class="menu-text">MySQL</span></a>
-        <a class="menu-item active" href="meilisearch.php"><span class="menu-icon">S</span><span class="menu-text">Meilisearch</span></a>
-    </aside>
+    <?php include 'sidebar.php'; ?>
 
     <main class="main">
         <header class="topbar">
@@ -346,7 +354,7 @@ a { color: inherit; text-decoration: none; }
         <section class="content">
             <div class="page-header">
                 <h1>Meilisearch</h1>
-                <p>AppleCMS 全文搜索引擎状态、索引统计、增量同步与收录检测</p>
+                <p>AppleCMS 全文搜索引擎状态、索引统计、增量同步与智能收录检测</p>
             </div>
 
             <?php if ($actionError): ?>
@@ -403,18 +411,18 @@ a { color: inherit; text-decoration: none; }
             </div>
 
             <?php if ($meiliConnected && $meiliIndexFound): ?>
-            <!-- 指定 ID 收录状态检测工具 -->
+            <!-- 智能收录状态与关键词检测工具 -->
             <div class="card">
                 <div class="card-title">
-                    <h3>ID Check Diagnostics (指定 ID 收录状态检测)</h3>
+                    <h3>Smart Diagnostics (智能收录与标题关键词检测)</h3>
                 </div>
-                <p style="font-size: 13px; color: #64748b; margin-top: 0;">输入苹果CMS的视频 ID（vod_id），直接在网页上检测该条数据是否已被 Meilisearch 收录。</p>
+                <p style="font-size: 13px; color: #64748b; margin-top: 0;">输入<strong>纯数字 ID</strong>（如 514156）则精准匹配单条文档；输入<strong>视频标题关键词</strong>（如 斗破苍穹）则检索对应的内容列表。</p>
                 
                 <form method="POST">
-                    <input type="hidden" name="action" value="id_check">
+                    <input type="hidden" name="action" value="smart_check">
                     <div class="form-group">
-                        <input type="text" name="check_id" class="form-control" placeholder="输入要查询的视频 ID（例如：514156）" value="<?php echo h($_POST['check_id'] ?? ''); ?>">
-                        <button type="submit" class="btn">立即检测 ID</button>
+                        <input type="text" name="check_keyword" class="form-control" placeholder="输入视频 ID (如 514156) 或 视频标题关键词" value="<?php echo h($_POST['check_keyword'] ?? ''); ?>">
+                        <button type="submit" class="btn">立即智能检测</button>
                     </div>
                 </form>
 
