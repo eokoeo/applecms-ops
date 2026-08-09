@@ -251,7 +251,7 @@ if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 // 输入的是文字/标题（当作关键词搜索查）
                 $searchRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/search", 'POST', [
                     'q' => $keyword,
-                    'limit' => 10
+                    'limit' => 50
                 ]);
                 if ($searchRes['success']) {
                     $checkResult = $searchRes['data'];
