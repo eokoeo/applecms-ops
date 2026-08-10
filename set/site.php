@@ -9,7 +9,7 @@
 declare(strict_types=1);
 
 session_start();
-
+require_once 'login.php';
 // 初始化修改计数器
 if (!isset($_SESSION['edit_counter'])) {
     $_SESSION['edit_counter'] = 0;
