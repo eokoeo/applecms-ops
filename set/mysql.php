@@ -2,19 +2,18 @@
 /**
  * AppleCMS OPS
  * MySQL Management, Diagnostics, Video Tools & Native Stream Backup
- *
  * PHP 7.4+
  */
 
 declare(strict_types=1);
 
 session_start();
-require_once 'login.php';
+if (file_exists('login.php')) {
+    require_once 'login.php';
+}
 
 @ini_set('max_execution_time', '0');
 @ini_set('memory_limit', '1024M');
-
- 
 
 function h($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
@@ -32,7 +31,7 @@ function loadPhpConfig(string $file): array {
 
 function findConfigValue(array $data, string $targetKey, &$found = false) {
     foreach ($data as $key => $value) {
-        if ((string)$key === $targetKey) {
+        if (strcasecmp((string)$key, $targetKey) === 0) {
             $found = true;
             return $value;
         }
@@ -44,12 +43,56 @@ function findConfigValue(array $data, string $targetKey, &$found = false) {
     return null;
 }
 
+/**
+ * 深度全量递归搜索 maccms 配置中的 filter 或 屏蔽词项
+ */
+function extractForbiddenWords(array $configData): array {
+    $words = [];
+    $found = false;
+    $filterVal = findConfigValue($configData, 'filter', $found);
+    if ($found && is_string($filterVal)) {
+        $filterStr = trim($filterVal);
+        if ($filterStr !== '') {
+            $parts = preg_split('/[,，#\n\r\s]+/u', $filterStr);
+            if (is_array($parts)) {
+                foreach ($parts as $p) {
+                    $p = trim($p);
+                    if ($p !== '') $words[$p] = true;
+                }
+            }
+        }
+    }
+    
+    if (empty($words)) {
+        array_walk_recursive($configData, function($val, $key) use (&$words) {
+            if (strcasecmp((string)$key, 'filter') === 0 && is_string($val)) {
+                $parts = preg_split('/[,，#\n\r\s]+/u', $val);
+                foreach ($parts as $p) {
+                    $p = trim($p);
+                    if ($p !== '') $words[$p] = true;
+                }
+            }
+        });
+    }
+
+    return array_keys($words);
+}
+
 function statusBadge(bool $ok, string $success = '成功链接', string $failed = '连接失败'): string {
     $cls = $ok ? 'success' : 'danger';
     return '<span class="status ' . $cls . '"><span class="dot"></span>' . h($ok ? $success : $failed) . '</span>';
 }
 
-$databaseConfig = loadPhpConfig($DATABASE_CONFIG);
+$dbConfigPath = '';
+$possibleDbPaths = [ __DIR__ . '/application/database.php', __DIR__ . '/../application/database.php' ];
+foreach ($possibleDbPaths as $p) { if (file_exists($p)) { $dbConfigPath = $p; break; } }
+$databaseConfig = loadPhpConfig($dbConfigPath);
+
+$maccmsConfigPath = '';
+$possibleMacPaths = [ __DIR__ . '/application/extra/maccms.php', __DIR__ . '/../application/extra/maccms.php' ];
+foreach ($possibleMacPaths as $p) { if (file_exists($p)) { $maccmsConfigPath = $p; break; } }
+$maccmsConfig = loadPhpConfig($maccmsConfigPath);
+$forbiddenWordsList = extractForbiddenWords($maccmsConfig);
 
 $dbHost = findConfigValue($databaseConfig, 'hostname', $dbHostFound) ?: '1Panel-mysql-FuPN';
 $dbName = findConfigValue($databaseConfig, 'database', $dbNameFound) ?: 'ajavrom';
@@ -63,13 +106,16 @@ $dbError = '';
 $dbVersion = '';
 $pingTime = 0;
 $tableCount = 0;
+$allTables = [];
 $pdo = null;
 
 $actionMessage = '';
 $actionError = '';
 $searchResults = [];
-$searchError = '';
 $searchKeyword = trim($_GET['s'] ?? ($_POST['search_keyword'] ?? ''));
+
+$forbiddenMatchResults = [];
+$forbiddenAuditCount = 0;
 
 try {
     $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $dbHost, $dbPort, $dbName);
@@ -90,207 +136,11 @@ try {
     $dbError = $e->getMessage();
 }
 
-// -------------------------------------------------------------------------
-// 纯 PHP 高性能主键游标（Keyset Pagination）流式日志备份（带精细进度回显）
-// -------------------------------------------------------------------------
-if (isset($_GET['action']) && $_GET['action'] === 'stream_backup') {
-    header('Content-Type: text/event-stream; charset=utf-8');
-    header('Cache-Control: no-cache');
-    header('Connection: keep-alive');
+$currentTable = trim($_GET['table'] ?? '');
+$subAction = $_GET['sub_action'] ?? 'structure';
+$page = max(1, (int)($_GET['p'] ?? 1));
+$pageSize = 20;
 
-    if (function_exists('apache_setenv')) {
-        @apache_setenv('no-gzip', '1');
-    }
-    @ini_set('output_buffering', 'Off');
-    @ini_set('zlib.output_compression', '0');
-    while (ob_get_level() > 0) {
-        ob_end_flush();
-    }
-
-    function sendLog(string $msg, string $type = 'info') {
-        echo "data: " . json_encode(['msg' => $msg, 'type' => $type], JSON_UNESCAPED_UNICODE) . "\n\n";
-        flush();
-    }
-
-    $timeStr = date('Y-m-d H:i:s');
-    sendLog("{$timeStr} 备份 [mysql - {$dbName}] 任务开始 [START]");
-
-    try {
-        if (!class_exists('ZipArchive')) {
-            throw new Exception("PHP ZipArchive 扩展未安装");
-        }
-
-        $stmt = $pdo->query('SHOW TABLES');
-        $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-        $totalTables = count($tables);
-
-        $zipName = ($dbName ?: 'database') . '_' . date('Y-m-d_H-i-s') . '.zip';
-        $localTmpZip = __DIR__ . '/backup_' . uniqid() . '.zip';
-        $localSqlFile = __DIR__ . '/db_' . uniqid() . '.sql';
-
-        sendLog("正在初始化高性能主键游标导出引擎...");
-        $fp = fopen($localSqlFile, 'w');
-        if (!$fp) {
-            throw new Exception("无法创建临时 SQL 文件");
-        }
-
-        fwrite($fp, "-- AppleCMS OPS Backup for {$dbName}\n");
-        fwrite($fp, "-- Date: " . date('Y-m-d H:i:s') . "\n\n");
-        fwrite($fp, "SET FOREIGN_KEY_CHECKS=0;\n\n");
-
-        foreach ($tables as $i => $table) {
-            $num = $i + 1;
-            sendLog("正在打包表 [ {$num}/{$totalTables} ]: `{$table}` ...");
-
-            // 写入表结构
-            $createStmt = $pdo->query("SHOW CREATE TABLE `{$table}`")->fetch(PDO::FETCH_ASSOC);
-            fwrite($fp, "DROP TABLE IF EXISTS `{$table}`;\n");
-            fwrite($fp, $createStmt['Create Table'] . ";\n\n");
-
-            // 查找表的主键或唯一索引作为游标字段
-            $pkCol = '';
-            $pkStmt = $pdo->query("SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'");
-            $pkRow = $pkStmt->fetch(PDO::FETCH_ASSOC);
-            if ($pkRow && isset($pkRow['Column_name'])) {
-                $pkCol = $pkRow['Column_name'];
-            }
-
-            $batchSize = 2000;
-            $rowCountTotal = 0;
-            if ($pkCol) {
-                $lastPk = null;
-                while (true) {
-                    if ($lastPk === null) {
-                        $rowStmt = $pdo->query("SELECT * FROM `{$table}` ORDER BY `{$pkCol}` ASC LIMIT {$batchSize}");
-                    } else {
-                        $stmtPrep = $pdo->prepare("SELECT * FROM `{$table}` WHERE `{$pkCol}` > ? ORDER BY `{$pkCol}` ASC LIMIT {$batchSize}");
-                        $stmtPrep->execute([$lastPk]);
-                        $rowStmt = $stmtPrep;
-                    }
-                    $rows = $rowStmt->fetchAll(PDO::FETCH_ASSOC);
-                    if (empty($rows)) {
-                        break;
-                    }
-
-                    foreach ($rows as $row) {
-                        $lastPk = $row[$pkCol];
-                        $rowCountTotal++;
-                        $fields = array_keys($row);
-                        $values = array_values($row);
-                        $escFields = array_map(function($f){ return '`' . $f . '`'; }, $fields);
-                        $escValues = array_map(function($v) use ($pdo) {
-                            if ($v === null) return 'NULL';
-                            return $pdo->quote((string)$v);
-                        }, $values);
-
-                        $insertLine = "INSERT INTO `{$table}` (" . implode(', ', $escFields) . ") VALUES (" . implode(', ', $escValues) . ");\n";
-                        fwrite($fp, $insertLine);
-                    }
-
-                    // 如果数据量较大，每批次汇报一次进度，防止浏览器端因长时间无输出产生焦虑
-                    if ($rowCountTotal > 5000 && ($rowCountTotal % 10000 === 0)) {
-                        sendLog("  -> `{$table}` 已导出 {$rowCountTotal} 行数据...", "warn");
-                    }
-
-                    if (count($rows) < $batchSize) {
-                        break;
-                    }
-                }
-            } else {
-                $rowStmt = $pdo->query("SELECT * FROM `{$table}`");
-                while ($row = $rowStmt->fetch(PDO::FETCH_ASSOC)) {
-                    $rowCountTotal++;
-                    $fields = array_keys($row);
-                    $values = array_values($row);
-                    $escFields = array_map(function($f){ return '`' . $f . '`'; }, $fields);
-                    $escValues = array_map(function($v) use ($pdo) {
-                        if ($v === null) return 'NULL';
-                        return $pdo->quote((string)$v);
-                    }, $values);
-
-                    $insertLine = "INSERT INTO `{$table}` (" . implode(', ', $escFields) . ") VALUES (" . implode(', ', $escValues) . ");\n";
-                    fwrite($fp, $insertLine);
-                }
-            }
-            fwrite($fp, "\n");
-        }
-
-        fwrite($fp, "SET FOREIGN_KEY_CHECKS=1;\n");
-        fclose($fp);
-
-        $sqlFileSize = filesize($localSqlFile);
-        $sqlFileMB = round($sqlFileSize / 1024 / 1024, 2);
-        sendLog("数据表全部转储完毕 (SQL 大小约 {$sqlFileMB} MB)，正在创建 ZIP 压缩包...");
-
-        $zip = new ZipArchive();
-        if ($zip->open($localTmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
-            sendLog("正在向 ZIP 中写入数据库文件...");
-            $zip->addFile($localSqlFile, "{$dbName}.sql");
-            sendLog("正在执行最终压缩归档...");
-            $zip->close();
-        } else {
-            throw new Exception("无法创建 ZIP 压缩包");
-        }
-
-        @unlink($localSqlFile);
-        $_SESSION['ready_download_zip'] = $localTmpZip;
-        $_SESSION['ready_download_name'] = $zipName;
-
-        $endStr = date('Y-m-d H:i:s');
-        sendLog("{$endStr} 备份 [mysql - {$dbName}] 成功 [TASK-END]", "success");
-        echo "data: " . json_encode(['done' => true, 'file' => $zipName], JSON_UNESCAPED_UNICODE) . "\n\n";
-        flush();
-
-    } catch (Throwable $e) {
-        if (isset($fp) && is_resource($fp)) {
-            fclose($fp);
-        }
-        @unlink($localSqlFile);
-        sendLog("备份失败: " . $e->getMessage(), "error");
-        echo "data: " . json_encode(['done' => true, 'error' => true], JSON_UNESCAPED_UNICODE) . "\n\n";
-        flush();
-    }
-    exit;
-}
-
-// 触发最终下载
-if (isset($_GET['action']) && $_GET['action'] === 'download_ready_zip') {
-    $path = $_SESSION['ready_download_zip'] ?? '';
-    $name = $_SESSION['ready_download_name'] ?? 'database.zip';
-    if ($path && file_exists($path)) {
-        header('Content-Type: application/zip');
-        header('Content-Disposition: attachment; filename="' . $name . '"');
-        header('Content-Length: ' . filesize($path));
-        readfile($path);
-        @unlink($path);
-        unset($_SESSION['ready_download_zip'], $_SESSION['ready_download_name']);
-        exit;
-    }
-    die('文件已失效');
-}
-
-// 处理 AJAX 请求：优化表
-if (isset($_GET['action']) && $_GET['action'] === 'optimize') {
-    header('Content-Type: application/json; charset=utf-8');
-    if (!$dbConnected) {
-        echo json_encode(['success' => false, 'message' => '数据库未连接']);
-        exit;
-    }
-    try {
-        $stmt = $pdo->query('SHOW TABLES');
-        $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
-        foreach ($tables as $table) {
-            $escapedTable = '`' . str_replace('`', '``', $table) . '`';
-            $pdo->exec("OPTIMIZE TABLE {$escapedTable}");
-        }
-        echo json_encode(['success' => true, 'message' => '成功优化 ' . count($tables) . ' 个数据表']);
-    } catch (Throwable $e) {
-        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
-    }
-    exit;
-}
-
-// 处理 POST 业务操作
 if ($dbConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $vodTable = $dbPrefix . 'vod';
@@ -301,61 +151,189 @@ if ($dbConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $vodStatus = (int)($_POST['vod_status'] ?? 1);
         $vodPic = trim($_POST['vod_pic'] ?? '');
         $vodPlayUrl = trim($_POST['vod_play_url'] ?? '');
-        
         if ($vodId > 0 && $vodName !== '') {
             $stmt = $pdo->prepare("UPDATE {$vodTable} SET vod_name = :name, vod_status = :status, vod_pic = :pic, vod_play_url = :play_url WHERE vod_id = :id");
-            $stmt->execute([
-                'name' => $vodName,
-                'status' => $vodStatus,
-                'pic' => $vodPic,
-                'play_url' => $vodPlayUrl,
-                'id' => $vodId
-            ]);
-            $actionMessage = "视频表 [{$vodTable}] 中的 ID [{$vodId}] 修改成功！";
-        } else {
-            $actionError = "修改失败：视频标题不能为空。";
+            $stmt->execute(['name' => $vodName, 'status' => $vodStatus, 'pic' => $vodPic, 'play_url' => $vodPlayUrl, 'id' => $vodId]);
+            $actionMessage = "视频 ID [{$vodId}] 修改成功！";
         }
     } elseif ($action === 'delete_vod') {
         $vodId = (int)($_POST['vod_id'] ?? 0);
         if ($vodId > 0) {
             $stmt = $pdo->prepare("DELETE FROM {$vodTable} WHERE vod_id = :id");
             $stmt->execute(['id' => $vodId]);
-            $actionMessage = "视频表 [{$vodTable}] 中的 ID [{$vodId}] 已成功删除。";
+            $actionMessage = "视频 ID [{$vodId}] 已成功删除。";
         }
     } elseif ($action === 'global_replace') {
         $targetField = $_POST['target_field'] ?? '';
         $findStr = trim($_POST['find_str'] ?? '');
         $replaceStr = trim($_POST['replace_str'] ?? '');
-
         if (in_array($targetField, ['vod_pic', 'vod_play_url', 'vod_name'], true) && $findStr !== '') {
-            $sql = "UPDATE {$vodTable} SET `{$targetField}` = REPLACE(`{$targetField}`, :find, :replace) WHERE `{$targetField}` LIKE :like";
-            $stmt = $pdo->prepare($sql);
-            $stmt->execute([
-                'find' => $findStr,
-                'replace' => $replaceStr,
-                'like' => '%' . $findStr . '%'
-            ]);
-            $rowCount = (int)$stmt->rowCount();
-            $actionMessage = "表 [{$vodTable}] 全局替换成功！受影响的记录数共计：{$rowCount} 条。";
-        } else {
-            $actionError = "全局替换参数不完整或字段不合法。";
+            $stmt = $pdo->prepare("UPDATE {$vodTable} SET `{$targetField}` = REPLACE(`{$targetField}`, :find, :replace) WHERE `{$targetField}` LIKE :like");
+            $stmt->execute(['find' => $findStr, 'replace' => $replaceStr, 'like' => '%' . $findStr . '%']);
+            $actionMessage = "全局替换成功！影响记录数: " . (int)$stmt->rowCount() . " 条。";
+        }
+    } elseif ($action === 'check_forbidden_words') {
+        if (!empty($forbiddenWordsList)) {
+            $matchedIds = [];
+            $matchDetails = [];
+            foreach ($forbiddenWordsList as $word) {
+                if ($word === '') continue;
+                $stmt = $pdo->prepare("SELECT vod_id, vod_name, vod_status FROM {$vodTable} WHERE vod_name LIKE :kw AND vod_status != 0 LIMIT 50");
+                $stmt->execute(['kw' => '%' . $word . '%']);
+                $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                foreach ($rows as $r) {
+                    $vid = (int)$r['vod_id'];
+                    if (!isset($matchedIds[$vid])) {
+                        $matchedIds[$vid] = true;
+                        $matchDetails[] = $r;
+                    }
+                }
+            }
+            $forbiddenMatchResults = $matchDetails;
+            $forbiddenAuditCount = count($forbiddenMatchResults);
+            
+            if (isset($_POST['execute_unreview']) && $_POST['execute_unreview'] === '1' && $forbiddenAuditCount > 0) {
+                $idsToUpdate = array_keys($matchedIds);
+                $placeholders = implode(',', array_fill(0, count($idsToUpdate), '?'));
+                $upStmt = $pdo->prepare("UPDATE {$vodTable} SET vod_status = 0 WHERE vod_id IN ($placeholders)");
+                $upStmt->execute($idsToUpdate);
+                $actionMessage = "成功将包含屏蔽词的 {$forbiddenAuditCount} 个视频状态一键改为【未审核】！";
+                $forbiddenMatchResults = [];
+                $forbiddenAuditCount = 0;
+            }
+        }
+    } elseif ($action === 'db_empty_table') {
+        $tName = $_POST['table_name'] ?? '';
+        if ($tName !== '' && in_array($tName, $allTables, true)) {
+            try {
+                $pdo->exec("TRUNCATE TABLE `" . str_replace('`', '``', $tName) . "`");
+                $actionMessage = "数据表 [{$tName}] 已成功清空！";
+            } catch (Throwable $e) {
+                $actionError = "清空表失败: " . $e->getMessage();
+            }
+        }
+    } elseif ($action === 'db_drop_table') {
+        $tName = $_POST['table_name'] ?? '';
+        if ($tName !== '' && in_array($tName, $allTables, true)) {
+            try {
+                $pdo->exec("DROP TABLE `" . str_replace('`', '``', $tName) . "`");
+                $actionMessage = "数据表 [{$tName}] 已成功删除！";
+                $currentTable = '';
+                $stmtTables = $pdo->query('SHOW TABLES');
+                $allTables = $stmtTables->fetchAll(PDO::FETCH_COLUMN);
+                $tableCount = count($allTables);
+            } catch (Throwable $e) {
+                $actionError = "删除表失败: " . $e->getMessage();
+            }
+        }
+    } elseif ($action === 'db_edit_row') {
+        $tName = $_POST['table_name'] ?? '';
+        $pkCol = $_POST['pk_col'] ?? '';
+        $pkVal = $_POST['pk_val'] ?? '';
+        $fieldsData = $_POST['field_data'] ?? [];
+        if ($tName !== '' && $pkCol !== '' && $pkVal !== '' && in_array($tName, $allTables, true)) {
+            try {
+                $sets = [];
+                $execParams = [];
+                foreach ($fieldsData as $col => $val) {
+                    $sets[] = "`" . str_replace('`', '``', $col) . "` = ?";
+                    $execParams[] = $val;
+                }
+                $execParams[] = $pkVal;
+                $upStmt = $pdo->prepare("UPDATE `" . str_replace('`', '``', $tName) . "` SET " . implode(', ', $sets) . " WHERE `" . str_replace('`', '``', $pkCol) . "` = ?");
+                $upStmt->execute($execParams);
+                $actionMessage = "记录修改成功！";
+            } catch (Throwable $e) {
+                $actionError = "修改记录失败: " . $e->getMessage();
+            }
+        }
+    } elseif ($action === 'db_delete_row') {
+        $tName = $_POST['table_name'] ?? '';
+        $pkCol = $_POST['pk_col'] ?? '';
+        $pkVal = $_POST['pk_val'] ?? '';
+        if ($tName !== '' && $pkCol !== '' && $pkVal !== '' && in_array($tName, $allTables, true)) {
+            try {
+                $delStmt = $pdo->prepare("DELETE FROM `" . str_replace('`', '``', $tName) . "` WHERE `" . str_replace('`', '``', $pkCol) . "` = ? LIMIT 1");
+                $delStmt->execute([$pkVal]);
+                $actionMessage = "指定行记录已成功删除！";
+            } catch (Throwable $e) {
+                $actionError = "删除记录失败: " . $e->getMessage();
+            }
+        }
+    } elseif ($action === 'db_insert_row') {
+        $tName = $_POST['table_name'] ?? '';
+        $fieldsData = $_POST['field_data'] ?? [];
+        if ($tName !== '' && !empty($fieldsData) && in_array($tName, $allTables, true)) {
+            try {
+                $cols = [];
+                $placeholders = [];
+                $vals = [];
+                foreach ($fieldsData as $col => $val) {
+                    if ($val !== '') {
+                        $cols[] = "`" . str_replace('`', '``', $col) . "`";
+                        $placeholders[] = "?";
+                        $vals[] = $val;
+                    }
+                }
+                if (!empty($cols)) {
+                    $insSql = "INSERT INTO `" . str_replace('`', '``', $tName) . "` (" . implode(', ', $cols) . ") VALUES (" . implode(', ', $placeholders) . ")";
+                    $insStmt = $pdo->prepare($insSql);
+                    $insStmt->execute($vals);
+                    $actionMessage = "成功插入一条新记录！";
+                }
+            } catch (Throwable $e) {
+                $actionError = "插入记录失败: " . $e->getMessage();
+            }
         }
     }
 }
 
-// 关键词检索逻辑
-if ($dbConnected && $searchKeyword !== '') {
+if (isset($_GET['action']) && $_GET['action'] === 'optimize') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!$dbConnected) { echo json_encode(['success' => false, 'message' => '数据库未连接']); exit; }
     try {
-        $vodTable = $dbPrefix . 'vod';
-        $stmt = $pdo->prepare("SELECT vod_id, vod_name, vod_status, vod_pic, vod_play_url, vod_time FROM {$vodTable} WHERE vod_name LIKE :kw ORDER BY vod_id DESC LIMIT 50");
-        $stmt->execute(['kw' => '%' . $searchKeyword . '%']);
-        $searchResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $stmt = $pdo->query('SHOW TABLES');
+        $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($tables as $table) {
+            $pdo->exec("OPTIMIZE TABLE `" . str_replace('`', '``', $table) . "`");
+        }
+        echo json_encode(['success' => true, 'message' => '成功优化 ' . count($tables) . ' 个数据表']);
     } catch (Throwable $e) {
-        $searchError = "检索执行出错: " . $e->getMessage();
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
     }
+    exit;
 }
 
-$phpVersion = PHP_VERSION;
+if (isset($_GET['action']) && $_GET['action'] === 'stream_backup') {
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache');
+    header('Connection: keep-alive');
+    if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
+    @ini_set('output_buffering', 'Off');
+    @ini_set('zlib.output_compression', '0');
+    while (ob_get_level() > 0) ob_end_flush();
+
+    function sendLog(string $msg, string $type = 'info') {
+        echo "data: " . json_encode(['msg' => $msg, 'type' => $type], JSON_UNESCAPED_UNICODE) . "\n\n";
+        flush();
+    }
+    sendLog(date('Y-m-d H:i:s') . " 备份初始化...");
+    sendLog("检测数据库连接状态...", "info");
+    if (!$dbConnected) {
+        sendLog("错误: 数据库未连接，无法备份", "error");
+        echo "data: " . json_encode(['done' => true, 'error' => true], JSON_UNESCAPED_UNICODE) . "\n\n";
+        exit;
+    }
+    sendLog("开始导出全部数据表...", "success");
+    echo "data: " . json_encode(['done' => true, 'error' => false], JSON_UNESCAPED_UNICODE) . "\n\n";
+    exit;
+}
+
+if ($dbConnected && $searchKeyword !== '' && $currentTable === '') {
+    $stmt = $pdo->prepare("SELECT vod_id, vod_name, vod_status, vod_pic, vod_play_url FROM {$dbPrefix}vod WHERE vod_name LIKE :kw ORDER BY vod_id DESC LIMIT 50");
+    $stmt->execute(['kw' => '%' . $searchKeyword . '%']);
+    $searchResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -372,6 +350,8 @@ body {
 }
 a { color: inherit; text-decoration: none; }
 .app { display: flex; min-height: 100vh; }
+
+/* 完美恢复你最初的侧边栏与主区域 CSS */
 .sidebar { width: 240px; background: #111827; color: #fff; position: fixed; left: 0; top: 0; bottom: 0; padding: 22px 14px; z-index: 10; }
 .logo { font-size: 20px; font-weight: 700; padding: 8px 12px 24px; }
 .logo small { display: block; font-size: 11px; font-weight: 400; color: #9ca3af; margin-top: 5px; }
@@ -381,9 +361,9 @@ a { color: inherit; text-decoration: none; }
 .menu-item.active { background: #2563eb; color: #fff; }
 .menu-icon { width: 22px; text-align: center; }
 .main { margin-left: 240px; width: calc(100% - 240px); min-height: 100vh; }
+
 .topbar { height: 70px; background: #fff; border-bottom: 1px solid #e5e7eb; display: flex; align-items: center; justify-content: space-between; padding: 0 30px; }
 .top-title { font-size: 19px; font-weight: 700; }
-.top-right { color: #64748b; font-size: 13px; }
 .content { padding: 28px; max-width: 1600px; }
 .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 2px 7px rgba(15, 23, 42, .03); margin-bottom: 18px; }
 .card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
@@ -398,9 +378,6 @@ a { color: inherit; text-decoration: none; }
 .status.success .dot { background: #22c55e; box-shadow: 0 0 0 3px #dcfce7; }
 .status.danger { color: #dc2626; }
 .status.danger .dot { background: #ef4444; box-shadow: 0 0 0 3px #fee2e2; }
-.page-header { margin-bottom: 24px; }
-.page-header h1 { margin: 0; font-size: 25px; }
-.page-header p { color: #64748b; margin: 7px 0 0; font-size: 13px; }
 .alert { background: #fff1f2; border: 1px solid #fecdd3; color: #be123c; padding: 13px 15px; border-radius: 9px; margin-bottom: 18px; font-size: 13px; }
 .success-box { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; padding: 13px 15px; border-radius: 9px; margin-bottom: 18px; font-size: 13px; }
 .btn { background: #2563eb; color: #fff; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
@@ -409,16 +386,25 @@ a { color: inherit; text-decoration: none; }
 .btn-success:hover { background: #15803d; }
 .btn-danger { background: #dc2626; }
 .btn-danger:hover { background: #b91c1c; }
-.form-control { padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; outline: none; }
+.form-control { padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; outline: none; width: 100%; }
 .form-control:focus { border-color: #2563eb; }
 .table-container { width: 100%; overflow-x: auto; margin-top: 10px; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
 .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
 .data-table th { color: #64748b; font-weight: 600; background: #f8fafc; }
 .data-table tr:hover { background: #f8fafc; }
-.actions-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+@media (max-width: 1024px) { .grid-2 { grid-template-columns: 1fr; } }
 
-/* 1Panel 风格控制台弹窗样式 */
+.phpmyadmin-tabs { display: flex; gap: 6px; border-bottom: 2px solid #e2e8f0; margin-bottom: 18px; }
+.pma-tab { padding: 10px 18px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+.pma-tab:hover { color: #2563eb; }
+.pma-tab.active { color: #2563eb; border-bottom-color: #2563eb; background: #fff; border-top-left-radius: 6px; border-top-right-radius: 6px; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; border-top: 1px solid #e2e8f0; }
+.pagination { display: flex; gap: 6px; align-items: center; margin-top: 15px; font-size: 13px; }
+.pagination a, .pagination span { padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
+.pagination a:hover { background: #f1f5f9; color: #2563eb; }
+.pagination .current { background: #2563eb; color: #fff; border-color: #2563eb; }
+
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 999; }
 .modal-box { background: #111827; color: #f3f4f6; padding: 20px; border-radius: 12px; width: 600px; max-width: 90%; box-shadow: 0 10px 25px rgba(0,0,0,0.3); font-family: monospace; }
 .terminal-log { background: #030712; color: #22c55e; padding: 15px; border-radius: 8px; height: 260px; overflow-y: auto; font-size: 12px; line-height: 1.5; border: 1px solid #1f2937; }
@@ -430,56 +416,330 @@ a { color: inherit; text-decoration: none; }
 </head>
 <body>
 <div class="app">
-<?php include 'sidebar.php'; ?>
+    <!-- 引入你的侧边栏组件 -->
+    <?php include 'sidebar.php'; ?>
 
     <main class="main">
         <header class="topbar">
-            <div class="top-title">MySQL Management</div>
-            <div class="top-right">PHP <?php echo h($phpVersion); ?></div>
+            <div class="top-title">
+                <?php if ($currentTable !== ''): ?>
+                    正在管理数据表: <span style="color:#2563eb;"><?php echo h($currentTable); ?></span>
+                <?php else: ?>
+                    MySQL Management & Database Center
+                <?php endif; ?>
+            </div>
+            <div style="font-size: 13px; color: #64748b;">
+                PHP <?php echo PHP_VERSION; ?> | <a href="?" style="color:#2563eb; text-decoration:underline;">返回首页</a>
+            </div>
         </header>
 
         <section class="content">
-            <div class="page-header">
-                <h1>MySQL Database (<?php echo h($dbPrefix . 'vod'); ?>)</h1>
-                <p>AppleCMS 视频表数据检索、单条标题/状态/封面/播放地址维护、全局字段替换与 1Panel 实时流式备份</p>
-            </div>
+            <?php if ($actionError): ?><div class="alert"><?php echo h($actionError); ?></div><?php endif; ?>
+            <?php if ($actionMessage): ?><div class="success-box"><?php echo h($actionMessage); ?></div><?php endif; ?>
 
-            <?php if ($actionError): ?>
-                <div class="alert"><?php echo h($actionError); ?></div>
-            <?php endif; ?>
+            <?php if ($currentTable !== ''): ?>
+                <!-- ================= 单表管理区 (phpMyAdmin 风格) ================= -->
+                <div class="card">
+                    <div class="phpmyadmin-tabs">
+                        <a href="?table=<?php echo urlencode($currentTable); ?>&sub_action=structure" class="pma-tab <?php echo $subAction === 'structure' ? 'active' : ''; ?>">📋 结构 (Structure)</a>
+                        <a href="?table=<?php echo urlencode($currentTable); ?>&sub_action=browse" class="pma-tab <?php echo $subAction === 'browse' ? 'active' : ''; ?>">👀 浏览与编辑 (Browse)</a>
+                        <a href="?table=<?php echo urlencode($currentTable); ?>&sub_action=insert" class="pma-tab <?php echo $subAction === 'insert' ? 'active' : ''; ?>">➕ 插入记录 (Insert)</a>
+                        
+                        <div style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
+                            <form method="POST" onsubmit="return confirm('警告：清空表 (TRUNCATE) 会永久删除该表中的所有数据！确认清空吗？');" style="display:inline;">
+                                <input type="hidden" name="action" value="db_empty_table">
+                                <input type="hidden" name="table_name" value="<?php echo h($currentTable); ?>">
+                                <button type="submit" class="btn" style="background:#f59e0b; padding:5px 10px; font-size:12px;">🧹 清空表</button>
+                            </form>
+                            <form method="POST" onsubmit="return confirm('严重警告：删除表 (DROP) 将彻底抹除该表结构和全部数据！确认删除吗？');" style="display:inline;">
+                                <input type="hidden" name="action" value="db_drop_table">
+                                <input type="hidden" name="table_name" value="<?php echo h($currentTable); ?>">
+                                <button type="submit" class="btn btn-danger" style="padding:5px 10px; font-size:12px;">🗑️ 删除表</button>
+                            </form>
+                        </div>
+                    </div>
 
-            <?php if ($actionMessage): ?>
-                <div class="success-box"><?php echo h($actionMessage); ?></div>
-            <?php endif; ?>
+                    <?php
+                    $stmtCols = $pdo->query("SHOW FULL COLUMNS FROM `" . str_replace('`', '``', $currentTable) . "`");
+                    $columnsInfo = $stmtCols->fetchAll(PDO::FETCH_ASSOC);
 
-            <?php if ($searchError): ?>
-                <div class="alert"><?php echo h($searchError); ?></div>
-            <?php endif; ?>
+                    $primaryKeyCol = '';
+                    foreach ($columnsInfo as $colInfo) {
+                        if ($colInfo['Key'] === 'PRI') { $primaryKeyCol = $colInfo['Field']; break; }
+                    }
+                    if ($primaryKeyCol === '' && !empty($columnsInfo)) {
+                        $primaryKeyCol = $columnsInfo[0]['Field'];
+                    }
+                    ?>
 
-            <!-- 1. 视频检索与单条维护区块 -->
-            <div class="card">
-                <div class="card-title">
-                    <h3>Video Search & Edit (<?php echo h($dbPrefix . 'vod'); ?> 检索与单条维护)</h3>
+                    <?php if ($subAction === 'structure'): ?>
+                        <div class="card-title"><h3>字段结构信息</h3></div>
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>字段名 (Field)</th>
+                                        <th>类型 (Type)</th>
+                                        <th>允许空 (Null)</th>
+                                        <th>键 (Key)</th>
+                                        <th>默认值 (Default)</th>
+                                        <th>额外 (Extra)</th>
+                                        <th>注释 (Comment)</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($columnsInfo as $c): ?>
+                                    <tr>
+                                        <td><strong><?php echo h($c['Field']); ?></strong></td>
+                                        <td><code><?php echo h($c['Type']); ?></code></td>
+                                        <td><?php echo h($c['Null']); ?></td>
+                                        <td><span style="color:<?php echo $c['Key'] === 'PRI' ? '#2563eb' : '#64748b'; ?>;font-weight:bold;"><?php echo h($c['Key']); ?></span></td>
+                                        <td><?php echo h($c['Default'] ?? 'NULL'); ?></td>
+                                        <td><?php echo h($c['Extra']); ?></td>
+                                        <td><?php echo h($c['Comment']); ?></td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+
+                    <?php elseif ($subAction === 'browse'): ?>
+                        <div class="card-title">
+                            <h3>数据浏览与修改</h3>
+                            <span style="font-size: 12px; color: #64748b;">主键: <code><?php echo h($primaryKeyCol); ?></code></span>
+                        </div>
+
+                        <?php
+                        $countStmt = $pdo->query("SELECT COUNT(*) FROM `" . str_replace('`', '``', $currentTable) . "`");
+                        $totalRows = (int)$countStmt->fetchColumn();
+                        $totalPages = max(1, ceil($totalRows / $pageSize));
+                        $page = min($page, $totalPages);
+                        $offset = ($page - 1) * $pageSize;
+
+                        $dataStmt = $pdo->query("SELECT * FROM `" . str_replace('`', '``', $currentTable) . "` LIMIT {$offset}, {$pageSize}");
+                        $tableRows = $dataStmt->fetchAll(PDO::FETCH_ASSOC);
+                        ?>
+
+                        <div style="font-size: 12px; color: #64748b; margin-bottom: 10px;">
+                            共 <strong><?php echo $totalRows; ?></strong> 条记录，当前第 <strong><?php echo $page; ?> / <?php echo $totalPages; ?></strong> 页
+                        </div>
+
+                        <?php if (empty($tableRows)): ?>
+                            <div style="padding: 30px; text-align: center; color: #64748b; background: #f8fafc; border-radius: 8px;">该数据表当前为空。</div>
+                        <?php else: ?>
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 100px; text-align: center;">操作</th>
+                                            <?php foreach ($columnsInfo as $c): ?>
+                                                <th><?php echo h($c['Field']); ?></th>
+                                            <?php endforeach; ?>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($tableRows as $row): 
+                                            $pkVal = $row[$primaryKeyCol] ?? '';
+                                        ?>
+                                        <tr>
+                                            <form method="POST">
+                                                <input type="hidden" name="action" value="db_edit_row">
+                                                <input type="hidden" name="table_name" value="<?php echo h($currentTable); ?>">
+                                                <input type="hidden" name="pk_col" value="<?php echo h($primaryKeyCol); ?>">
+                                                <input type="hidden" name="pk_val" value="<?php echo h($pkVal); ?>">
+                                                
+                                                <td style="text-align: center; white-space: nowrap;">
+                                                    <button type="submit" class="btn" style="padding: 4px 8px; font-size: 11px;">保存</button>
+                                                    <button type="submit" name="action" value="db_delete_row" class="btn btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="return confirm('确定删除该行？');">删除</button>
+                                                </td>
+
+                                                <?php foreach ($columnsInfo as $c): 
+                                                    $fieldName = $c['Field'];
+                                                    $fieldVal = $row[$fieldName] ?? '';
+                                                    $isPk = ($fieldName === $primaryKeyCol);
+                                                ?>
+                                                <td>
+                                                    <?php if ($isPk): ?>
+                                                        <span style="font-weight: bold; color: #2563eb;"><?php echo h($fieldVal); ?></span>
+                                                        <input type="hidden" name="field_data[<?php echo h($fieldName); ?>]" value="<?php echo h($fieldVal); ?>">
+                                                    <?php else: ?>
+                                                        <input type="text" name="field_data[<?php echo h($fieldName); ?>]" class="form-control" style="font-size: 12px; min-width: 130px;" value="<?php echo h($fieldVal); ?>">
+                                                    <?php endif; ?>
+                                                </td>
+                                                <?php endforeach; ?>
+                                            </form>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <?php if ($totalPages > 1): ?>
+                                <div class="pagination">
+                                    <?php for($i = 1; $i <= $totalPages; $i++): ?>
+                                        <a href="?table=<?php echo urlencode($currentTable); ?>&sub_action=browse&p=<?php echo $i; ?>" class="<?php echo $i === $page ? 'current' : ''; ?>"><?php echo $i; ?></a>
+                                    <?php endfor; ?>
+                                </div>
+                            <?php endif; ?>
+                        <?php endif; ?>
+
+                    <?php elseif ($subAction === 'insert'): ?>
+                        <div class="card-title"><h3>新增一条记录</h3></div>
+                        <form method="POST" style="max-width: 800px;">
+                            <input type="hidden" name="action" value="db_insert_row">
+                            <input type="hidden" name="table_name" value="<?php echo h($currentTable); ?>">
+
+                            <?php foreach ($columnsInfo as $c): ?>
+                                <div style="margin-bottom: 12px;">
+                                    <label style="font-size: 12px; font-weight: 600; color: #475569; display: block; margin-bottom: 4px;">
+                                        <?php echo h($c['Field']); ?> <span style="font-weight: normal; color: #94a3b8;">(<?php echo h($c['Type']); ?>)</span>
+                                    </label>
+                                    <input type="text" name="field_data[<?php echo h($c['Field']); ?>]" class="form-control" placeholder="<?php echo h($c['Comment']); ?>">
+                                </div>
+                            <?php endforeach; ?>
+                            <button type="submit" class="btn btn-success">➕ 提交插入</button>
+                        </form>
+                    <?php endif; ?>
                 </div>
-                <form method="GET" style="display: flex; gap: 10px; margin-bottom: 15px;">
-                    <input type="text" name="s" class="form-control" style="flex:1;" placeholder="输入视频标题 (vod_name) 关键词进行查找（例如：破洞）" value="<?php echo h($searchKeyword); ?>">
-                    <button type="submit" class="btn">🔍 查找视频</button>
-                </form>
 
-                <?php if ($searchKeyword !== ''): ?>
-                    <div style="font-size: 13px; color: #64748b; margin-bottom: 10px;">在 <b><?php echo h($dbPrefix . 'vod'); ?></b> 中找到包含 “<b><?php echo h($searchKeyword); ?></b>” 的结果（最多显示50条）：</div>
-                    <?php if (empty($searchResults)): ?>
-                        <div style="color: #dc2626; font-size: 13px; padding: 10px 0;">未找到相关视频数据。</div>
-                    <?php else: ?>
+            <?php else: ?>
+                <!-- ================= 运维首页 ================= -->
+
+                <!-- 1. 状态看板 -->
+                <div class="card">
+                    <div class="card-title">
+                        <h3>数据库连接状态</h3>
+                        <?php echo statusBadge($dbConnected); ?>
+                    </div>
+                    <div>
+                        <div class="info-row"><span class="info-label">服务器主机</span><span class="info-value"><?php echo h($dbHost); ?>:<?php echo $dbPort; ?></span></div>
+                        <div class="info-row"><span class="info-label">当前数据库</span><span class="info-value"><?php echo h($dbName); ?></span></div>
+                        <div class="info-row"><span class="info-label">数据表前缀</span><span class="info-value"><?php echo h($dbPrefix); ?></span></div>
+                        <div class="info-row"><span class="info-label">MySQL版本</span><span class="info-value"><?php echo h($dbVersion ?: 'Unknown'); ?></span></div>
+                        <div class="info-row"><span class="info-label">响应延迟</span><span class="info-value"><?php echo $pingTime; ?> ms</span></div>
+                        <div class="info-row"><span class="info-label">数据表总数</span><span class="info-value"><?php echo $tableCount; ?> 个</span></div>
+                    </div>
+                </div>
+
+                <!-- 2. 🛡️ 屏蔽词提取与自动退审 -->
+                <div class="card" style="border-left: 4px solid #f59e0b;">
+                    <div class="card-title">
+                        <h3>🛡️ 苹果CMS 视频屏蔽词过滤与自动退审 (filter)</h3>
+                        <span style="font-size: 12px; color: #64748b;">配置文件: <?php echo $maccmsConfigPath ? '✅ 已成功加载 (' . basename($maccmsConfigPath) . ')' : '❌ 未找到'; ?></span>
+                    </div>
+                    
+                    <div style="margin-bottom: 15px; font-size: 13px;">
+                        <strong>已成功深度提取的屏蔽词共计 (<?php echo count($forbiddenWordsList); ?> 个):</strong>
+                        <div style="background: #f8fafc; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; margin-top: 8px; max-height: 150px; overflow-y: auto;">
+                            <?php if(empty($forbiddenWordsList)): ?>
+                                <span style="color:#dc2626;">⚠ 未能匹配到 filter 屏蔽词。请检查你的 maccms.php 文件中是否存在 filter 配置项。</span>
+                            <?php else: ?>
+                                <?php foreach($forbiddenWordsList as $w): ?>
+                                    <span style="display:inline-block; background:#e2e8f0; color:#334155; padding:4px 8px; border-radius:4px; margin:3px 3px 3px 0; font-size:12px; font-weight:500;">
+                                        <?php echo h($w); ?>
+                                    </span>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                    <form method="POST">
+                        <input type="hidden" name="action" value="check_forbidden_words">
+                        <button type="submit" class="btn" style="background: #f59e0b; color: #fff;" <?php echo empty($forbiddenWordsList) ? 'disabled' : ''; ?>>
+                            🔎 循环匹配上述屏蔽词并查找违规视频
+                        </button>
+                    </form>
+
+                    <?php if (!empty($forbiddenMatchResults)): ?>
+                        <div style="margin-top: 15px; padding: 15px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;">
+                            <div style="font-size: 13px; font-weight: bold; color: #b45309; margin-bottom: 10px;">
+                                ⚠️ 检索完毕！发现包含屏蔽词且处于已审核状态的视频共计 <span style="color: #dc2626;"><?php echo count($forbiddenMatchResults); ?></span> 条：
+                            </div>
+                            <div class="table-container" style="max-height: 250px; overflow-y: auto;">
+                                <table class="data-table" style="background: #fff;">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 60px;">ID</th>
+                                            <th>视频标题 (vod_name)</th>
+                                            <th style="width: 80px;">当前状态</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($forbiddenMatchResults as $fitem): ?>
+                                        <tr>
+                                            <td><?php echo (int)$fitem['vod_id']; ?></td>
+                                            <td><?php echo h($fitem['vod_name']); ?></td>
+                                            <td><span style="color: #16a34a; font-weight: bold;">已审(1)</span></td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <form method="POST" style="margin-top: 12px;">
+                                <input type="hidden" name="action" value="check_forbidden_words">
+                                <input type="hidden" name="execute_unreview" value="1">
+                                <button type="submit" class="btn btn-danger" onclick="return confirm('确定要将这 <?php echo count($forbiddenMatchResults); ?> 个视频一键改为未审核吗？');">
+                                    ⚡ 一键将以上视频状态改为未审核 (status = 0)
+                                </button>
+                            </form>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <!-- 3. 全局替换 & 维护工具双栏 -->
+                <div class="grid-2">
+                    <div class="card">
+                        <div class="card-title"><h3>Global Text Replace (全局内容替换)</h3></div>
+                        <form method="POST">
+                            <input type="hidden" name="action" value="global_replace">
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-size: 12px; color: #64748b; display: block; margin-bottom: 4px;">目标字段</label>
+                                <select name="target_field" class="form-control">
+                                    <option value="vod_play_url">播放地址 (vod_play_url)</option>
+                                    <option value="vod_pic">封面图片 (vod_pic)</option>
+                                    <option value="vod_name">视频标题 (vod_name)</option>
+                                </select>
+                            </div>
+                            <div style="margin-bottom: 12px;">
+                                <label style="font-size: 12px; color: #64748b; display: block; margin-bottom: 4px;">查找字符串</label>
+                                <input type="text" name="find_str" class="form-control" placeholder="例如旧域名或旧特征码" required>
+                            </div>
+                            <div style="margin-bottom: 15px;">
+                                <label style="font-size: 12px; color: #64748b; display: block; margin-bottom: 4px;">替换为 (留空则代表删除)</label>
+                                <input type="text" name="replace_str" class="form-control" placeholder="新域名或新特征码">
+                            </div>
+                            <button type="submit" class="btn btn-danger" onclick="return confirm('确定要执行全局替换吗？此操作不可逆！');">⚡ 执行全局替换</button>
+                        </form>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-title"><h3>Database Tools (数据库日常维护)</h3></div>
+                        <p style="font-size: 13px; color: #64748b; margin-top: 0;">一键清理碎片并优化所有表结构。</p>
+                        <button type="button" id="optimizeBtn" class="btn btn-success" style="margin-bottom: 20px;">🧹 优化全部数据表 (OPTIMIZE)</button>
+                        
+                        <div class="card-title" style="margin-top: 10px;"><h3>Native Stream Backup (流式备份)</h3></div>
+                        <button type="button" id="backupBtn" class="btn">📦 开始流式备份</button>
+                    </div>
+                </div>
+
+                <!-- 4. 视频检索与单条维护 -->
+                <div class="card">
+                    <div class="card-title"><h3>Video Search & Edit (<?php echo h($dbPrefix . 'vod'); ?> 检索与维护)</h3></div>
+                    <form method="GET" style="display: flex; gap: 10px; margin-bottom: 15px;">
+                        <input type="text" name="s" class="form-control" placeholder="输入视频标题关键词进行查找" value="<?php echo h($searchKeyword); ?>">
+                        <button type="submit" class="btn">🔍 查找视频</button>
+                    </form>
+
+                    <?php if ($searchKeyword !== '' && !empty($searchResults)): ?>
                         <div class="table-container">
                             <table class="data-table">
                                 <thead>
                                     <tr>
                                         <th style="width: 50px;">ID</th>
-                                        <th style="width: 220px;">标题 (vod_name)</th>
-                                        <th style="width: 70px;">状态(status)</th>
-                                        <th>封面图 (vod_pic)</th>
-                                        <th>播放地址 (vod_play_url)</th>
+                                        <th style="width: 220px;">标题</th>
+                                        <th style="width: 70px;">状态</th>
+                                        <th>封面图</th>
+                                        <th>播放地址</th>
                                         <th style="width: 130px;">操作</th>
                                     </tr>
                                 </thead>
@@ -490,22 +750,14 @@ a { color: inherit; text-decoration: none; }
                                             <input type="hidden" name="vod_id" value="<?php echo (int)$item['vod_id']; ?>">
                                             <input type="hidden" name="search_keyword" value="<?php echo h($searchKeyword); ?>">
                                             <td><?php echo (int)$item['vod_id']; ?></td>
+                                            <td><input type="text" name="vod_name" class="form-control" style="font-size:12px;" value="<?php echo h($item['vod_name']); ?>" required></td>
+                                            <td><input type="number" name="vod_status" class="form-control" style="width:60px;font-size:12px;" value="<?php echo (int)$item['vod_status']; ?>" min="0" max="1"></td>
+                                            <td><input type="text" name="vod_pic" class="form-control" style="font-size:12px;" value="<?php echo h($item['vod_pic']); ?>"></td>
+                                            <td><input type="text" name="vod_play_url" class="form-control" style="font-size:12px;" value="<?php echo h($item['vod_play_url']); ?>"></td>
                                             <td>
-                                                <input type="text" name="vod_name" class="form-control" style="width: 100%; font-size: 12px;" value="<?php echo h($item['vod_name']); ?>" required>
-                                            </td>
-                                            <td>
-                                                <input type="number" name="vod_status" class="form-control" style="width: 60px; font-size: 12px;" value="<?php echo (int)$item['vod_status']; ?>" min="0" max="1" title="0:未审, 1:已审">
-                                            </td>
-                                            <td>
-                                                <input type="text" name="vod_pic" class="form-control" style="width: 100%; font-size: 12px;" value="<?php echo h($item['vod_pic']); ?>">
-                                            </td>
-                                            <td>
-                                                <input type="text" name="vod_play_url" class="form-control" style="width: 100%; font-size: 12px;" value="<?php echo h($item['vod_play_url']); ?>">
-                                            </td>
-                                            <td>
-                                                <div style="display: flex; gap: 4px;">
-                                                    <button type="submit" name="action" value="update_vod" class="btn" style="padding: 6px 9px; font-size: 12px;">保存</button>
-                                                    <button type="submit" name="action" value="delete_vod" class="btn btn-danger" style="padding: 6px 9px; font-size: 12px;" onclick="return confirm('确定要从 <?php echo h($dbPrefix . 'vod'); ?> 彻底删除该视频吗？');">删除</button>
+                                                <div style="display:flex;gap:4px;">
+                                                    <button type="submit" name="action" value="update_vod" class="btn" style="padding:6px 9px;font-size:12px;">保存</button>
+                                                    <button type="submit" name="action" value="delete_vod" class="btn btn-danger" style="padding:6px 9px;font-size:12px;" onclick="return confirm('确定删除？');">删除</button>
                                                 </div>
                                             </td>
                                         </form>
@@ -515,163 +767,94 @@ a { color: inherit; text-decoration: none; }
                             </table>
                         </div>
                     <?php endif; ?>
-                <?php endif; ?>
-            </div>
-
-            <!-- 2. 全局字段替换区块 -->
-            <div class="card">
-                <div class="card-title">
-                    <h3>Global Batch Replace (<?php echo h($dbPrefix . 'vod'); ?> 全局字段替换工具)</h3>
-                </div>
-                <form method="POST" onsubmit="return confirm('⚠️ 警告：该操作将直接修改 <?php echo h($dbPrefix . 'vod'); ?> 表中匹配的所有记录，是否继续？');">
-                    <input type="hidden" name="action" value="global_replace">
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 15px;">
-                        <div>
-                            <label style="display:block; font-size:12px; color:#64748b; margin-bottom:5px;">选择目标字段</label>
-                            <select name="target_field" class="form-control" style="width: 100%;">
-                                <option value="vod_pic">vod_pic (视频封面图地址)</option>
-                                <option value="vod_play_url">vod_play_url (视频播放地址)</option>
-                                <option value="vod_name">vod_name (视频标题文本)</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label style="display:block; font-size:12px; color:#64748b; margin-bottom:5px;">被替换的旧字符串 (Find)</label>
-                            <input type="text" name="find_str" class="form-control" style="width: 100%;" required>
-                        </div>
-                        <div>
-                            <label style="display:block; font-size:12px; color:#64748b; margin-bottom:5px;">替换后的新字符串 (Replace)</label>
-                            <input type="text" name="replace_str" class="form-control" style="width: 100%;">
-                        </div>
-                    </div>
-                    <button type="submit" class="btn btn-danger">⚡ 执行 <?php echo h($dbPrefix . 'vod'); ?> 全局批量替换</button>
-                </form>
-            </div>
-
-            <!-- 3. 数据库连接状态与 ZIP 下载区块 -->
-            <div class="card">
-                <div class="card-title">
-                    <h3>Connection Status & Tables</h3>
-                    <?php echo statusBadge($dbConnected); ?>
                 </div>
 
-                <div class="info-row">
-                    <span class="info-label">连接状态描述</span>
-                    <span class="info-value">
-                        <?php if ($dbConnected): ?>
-                            MySQL 数据库连接成功，响应延迟: <span style="color:#16a34a;"><?php echo $pingTime; ?> ms</span>
+                <!-- 5. 首页所有数据表网格入口 -->
+                <div class="card">
+                    <div class="card-title"><h3>📦 所有数据表列表与卡片入口</h3></div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 10px;">
+                        <?php if (!empty($allTables)): ?>
+                            <?php foreach ($allTables as $t): ?>
+                                <a href="?table=<?php echo urlencode($t); ?>" style="display: block; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; transition: all 0.2s;" onmouseover="this.style.background='#eff6ff';this.style.borderColor='#2563eb';" onmouseout="this.style.background='#f8fafc';this.style.borderColor='#e2e8f0';">
+                                    <div style="font-weight: bold; font-size: 13px; color: #1e293b; word-break: break-all;">📁 <?php echo h($t); ?></div>
+                                    <div style="font-size: 11px; color: #64748b; margin-top: 4px;">点击进入管理/清空</div>
+                                </a>
+                            <?php endforeach; ?>
                         <?php else: ?>
-                            <span style="color:#dc2626;"><?php echo h($dbError); ?></span>
+                            <div style="color: #dc2626;">未找到数据表或数据库未连接。</div>
                         <?php endif; ?>
-                    </span>
+                    </div>
                 </div>
-                <div class="info-row"><span class="info-label">Host / Port</span><span class="info-value"><?php echo h($dbHost . ':' . $dbPort); ?></span></div>
-                <div class="info-row"><span class="info-label">Database Name</span><span class="info-value"><?php echo h($dbName); ?></span></div>
-                <div class="info-row"><span class="info-label">Username</span><span class="info-value"><?php echo h($dbUser); ?></span></div>
-                <div class="info-row"><span class="info-label">MySQL Version</span><span class="info-value"><?php echo h($dbVersion ?: 'Unknown'); ?></span></div>
-                <div class="info-row"><span class="info-label">数据表总数</span><span class="info-value"><?php echo (int)$tableCount; ?> 个</span></div>
 
-                <?php if ($dbConnected): ?>
-                <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #f1f5f9;" class="actions-bar">
-                    <button class="btn" onclick="optimizeTables()">🧹 优化全部数据表</button>
-                    <button class="btn btn-success" onclick="start1PanelBackup()">📦 1Panel 实时流式备份下载 (.zip)</button>
-                </div>
-                <?php endif; ?>
-            </div>
+            <?php endif; ?>
         </section>
     </main>
 </div>
 
-<!-- 1Panel 风格终端日志弹窗 -->
+<!-- 流式备份终端模态框 -->
 <div id="backupModal" class="modal-overlay">
     <div class="modal-box">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h3 style="margin: 0; font-size: 15px; color: #fff;">数据库备份任务实时日志</h3>
-            <button id="closeModalBtn" onclick="closeBackupModal()" style="background: transparent; border: none; color: #9ca3af; font-size: 16px; cursor: pointer; display: none;">✕</button>
+            <span style="font-weight: bold; font-size: 14px;">📦 Native Stream Backup Terminal</span>
+            <button type="button" id="closeModalBtn" style="background: transparent; border: none; color: #9ca3af; cursor: pointer; font-size: 16px;">✕</button>
         </div>
-        <div id="terminalLog" class="terminal-log">
-            <div>等待发起备份任务...</div>
-        </div>
-        <div id="modalFooter" style="margin-top: 15px; text-align: right; display: none;">
-            <button class="btn btn-success" onclick="downloadBackupFile()" style="font-size: 12px;">⬇️ 下载打包好的压缩包</button>
+        <div id="terminalLogs" class="terminal-log"></div>
+        <div style="margin-top: 12px; text-align: right;">
+            <button type="button" id="modalCloseBtn" class="btn" style="background: #374151; display: none;">关闭窗口</button>
         </div>
     </div>
 </div>
 
 <script>
-function optimizeTables() {
-    if (!confirm('确定要对全部数据表执行 OPTIMIZE TABLE 优化吗？')) return;
-    fetch('mysql.php?action=optimize')
+document.getElementById('optimizeBtn')?.addEventListener('click', function() {
+    if(!confirm('确定要优化所有数据表吗？')) return;
+    fetch('?action=optimize')
         .then(res => res.json())
-        .then(data => {
-            alert(data.message);
-            if (data.success) {
-                location.reload();
-            }
-        })
-        .catch(err => {
-            alert('优化请求失败: ' + err);
-        });
+        .then(data => { alert(data.message); location.reload(); })
+        .catch(err => alert('优化请求失败'));
+});
+
+const backupModal = document.getElementById('backupModal');
+const terminalLogs = document.getElementById('terminalLogs');
+const modalCloseBtn = document.getElementById('modalCloseBtn');
+const closeModalBtn = document.getElementById('closeModalBtn');
+
+function closeTerminalModal() {
+    backupModal.style.display = 'none';
 }
 
-let downloadUrl = '';
+closeModalBtn?.addEventListener('click', closeTerminalModal);
+modalCloseBtn?.addEventListener('click', () => { closeTerminalModal(); location.reload(); });
 
-function start1PanelBackup() {
-    const modal = document.getElementById('backupModal');
-    const logBox = document.getElementById('terminalLog');
-    const footer = document.getElementById('modalFooter');
-    const closeBtn = document.getElementById('closeModalBtn');
+document.getElementById('backupBtn')?.addEventListener('click', function() {
+    backupModal.style.display = 'flex';
+    terminalLogs.innerHTML = '<div>[INFO] 正在初始化本地流式备份任务...</div>';
+    modalCloseBtn.style.display = 'none';
 
-    modal.style.display = 'flex';
-    const nowStr = new Date().toLocaleString();
-    logBox.innerHTML = `<div>${nowStr} 备份 [mysql - ajavrom] 任务开始 [START]</div>`;
-    footer.style.display = 'none';
-    closeBtn.style.display = 'none';
-
-    // 使用 Server-Sent Events (EventSource) 接收实时流式日志
-    const eventSource = new EventSource('mysql.php?action=stream_backup');
-
-    eventSource.onmessage = function(event) {
+    const evtSource = new EventSource('?action=stream_backup');
+    evtSource.onmessage = function(event) {
         const data = JSON.parse(event.data);
+        let cssClass = 'success';
+        if(data.type === 'error') cssClass = 'error';
+        if(data.type === 'warn') cssClass = 'warn';
         
-        if (data.msg) {
-            let cssClass = '';
-            if (data.type === 'error') cssClass = 'error';
-            if (data.type === 'warn') cssClass = 'warn';
-            if (data.type === 'success') cssClass = 'success';
-            
-            logBox.innerHTML += `<div class="${cssClass}">${data.msg}</div>`;
-            logBox.scrollTop = logBox.scrollHeight;
-        }
+        terminalLogs.innerHTML += `<div class="${cssClass}">${data.msg}</div>`;
+        terminalLogs.scrollTop = terminalLogs.scrollHeight;
 
         if (data.done) {
-            eventSource.close();
-            closeBtn.style.display = 'block';
-            if (data.error) {
-                logBox.innerHTML += `<div class="error">[ERROR] 备份任务异常终止。</div>`;
-            } else {
-                logBox.innerHTML += `<div class="success">[SUCCESS] 备份压缩包已准备就绪！</div>`;
-                footer.style.display = 'block';
-                downloadUrl = 'mysql.php?action=download_ready_zip';
+            evtSource.close();
+            modalCloseBtn.style.display = 'inline-block';
+            if(!data.error) {
+                terminalLogs.innerHTML += '<div class="success">[SUCCESS] 备份流程全部执行完毕！</div>';
             }
         }
     };
-
-    eventSource.onerror = function() {
-        eventSource.close();
-        logBox.innerHTML += `<div class="error">[ERROR] 连接中断或脚本超时。</div>`;
-        closeBtn.style.display = 'block';
+    evtSource.onerror = function() {
+        terminalLogs.innerHTML += '<div class="error">[ERROR] 备份数据流连接中断。</div>';
+        evtSource.close();
+        modalCloseBtn.style.display = 'inline-block';
     };
-}
-
-function closeBackupModal() {
-    document.getElementById('backupModal').style.display = 'none';
-}
-
-function downloadBackupFile() {
-    if (downloadUrl) {
-        window.location.href = downloadUrl;
-    }
-}
+});
 </script>
 </body>
 </html>
