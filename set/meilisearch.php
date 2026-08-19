@@ -236,16 +236,22 @@ if ($meiliConnected && $_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     } elseif ($action === 'smart_check') {
         $keyword = trim($_POST['check_keyword'] ?? '');
+        $keyword = trim($_POST['check_keyword'] ?? '');
         if ($keyword !== '') {
-            // 判断输入的是否为纯数字（当作 ID 精确查）
-            if (ctype_digit($keyword)) {
-                $checkRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents/{$keyword}");
+            // 判断输入的是否为纯数字，或者以 vod_ 开头的 ID
+            if (ctype_digit($keyword) || strpos($keyword, 'vod_') === 0) {
+                // 如果用户输入的是纯数字（如 4460），自动补全为 vod_4460；如果是 vod_4460 则保持不变
+                $targetId = ctype_digit($keyword) ? 'vod_' . $keyword : $keyword;
+                
+                // 直接请求该主键对应的单文档
+                $checkRes = meiliRequest($meiliHost, $meiliApiKey, "indexes/{$meiliIndex}/documents/{$targetId}");
+                
                 if ($checkRes['success']) {
                     $checkResult = $checkRes['data'];
-                    $actionMessage = "检测成功：ID [{$keyword}] 已被收录。";
+                    $actionMessage = "检测成功：ID [{$targetId}] 已被收录。";
                 } else {
-                    $checkResult = $checkRes['data'];
-                    $actionError = "检测结果：ID [{$keyword}] 尚未被收录 (Document not found)。";
+                    $checkResult = $checkRes['data'] ?? null;
+                    $actionError = "检测结果：ID [{$targetId}] 尚未被收录 (Document not found)。";
                 }
             } else {
                 // 输入的是文字/标题（当作关键词搜索查）
